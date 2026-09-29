@@ -742,3 +742,117 @@ test("real npx skills --copy: every copy is rendered and re-rendered", { skip: !
   assert.deepEqual(check(root), []);
   for (const base of [".agents", ".claude"]) assert.match(read(root, `${base}/skills/to-tickets/SKILL.md`), /`work\//);
 });
+
+// ---------------------------------------------------------------- fourth review
+
+test("S1: a run that stops before writing the lock is recovered, not forced", () => {
+  const root = project();
+  setPaths(root, ["adrDir=decisions"]);
+  apply(root, { log: quiet });
+  const lockA = read(root, LOCK_FILE);
+  setPaths(root, ["adrDir=adr-log"]);
+  apply(root, { log: quiet });
+  writeFileSync(join(root, LOCK_FILE), lockA); // as if the run stopped before its lock write
+  assert.ok(check(root).some((p) => p.includes("domain-modeling was rendered but the lock does not record it")));
+  apply(root, { log: quiet });
+  assert.deepEqual(check(root), []);
+  setPaths(root, ["adrDir=adr-final"]);
+  apply(root, { log: quiet, skipMigration: true });
+  const text = read(root, ".agents/skills/domain-modeling/ADR-FORMAT.md");
+  assert.match(text, /adr-final\//);
+  assert.doesNotMatch(text, /adr-log|decisions\//);
+});
+
+test("S1: the reviewer's crash (dangling CLAUDE.md) leaves a recoverable project", () => {
+  const root = project();
+  symlinkSync("missing/CLAUDE.md", join(root, "CLAUDE.md"));
+  setPaths(root, ["adrDir=decisions"]);
+  assert.throws(() => apply(root, { log: quiet }), /ENOENT/);
+  rmSync(join(root, "CLAUDE.md"));
+  apply(root, { log: quiet });
+  setPaths(root, ["adrDir=adr-log"]);
+  apply(root, { log: quiet, skipMigration: true });
+  assert.match(read(root, ".agents/skills/domain-modeling/ADR-FORMAT.md"), /`adr-log\/`/);
+  assert.deepEqual(check(root), []);
+});
+
+test("S1: a lost lock plus new paths restores from saved originals under --force", () => {
+  const root = project();
+  setPaths(root, ["adrDir=decisions"]);
+  apply(root, { log: quiet });
+  rmSync(join(root, LOCK_FILE));
+  setPaths(root, ["adrDir=adr-log"]);
+  assert.throws(() => apply(root, { log: quiet }), /pass --force to restore the files this script rewrote/);
+  const logs = [];
+  apply(root, { log: (m) => logs.push(m), force: true, skipMigration: true });
+  assert.ok(!logs.some((l) => l.includes("takes the current text")));
+  const text = read(root, ".agents/skills/domain-modeling/ADR-FORMAT.md");
+  assert.match(text, /`adr-log\/`/);
+  assert.doesNotMatch(text, /decisions\//);
+  assert.deepEqual(check(root), []);
+});
+
+test("S3: an edited copy never configured here recommends reinstalling over --force", () => {
+  const root = project();
+  writeFileSync(join(root, ".agents/skills/tdd/SKILL.md"), "edited");
+  assert.throws(() => apply(root, { log: quiet }), /never configured here; reinstall it \(--force would take its current text/);
+  const logs = [];
+  apply(root, { log: (m) => logs.push(m), force: true });
+  assert.ok(logs.some((l) => l.includes("--force takes the current text of .agents/skills/tdd")));
+});
+
+test("S2: a link to the repo root in a moving file stays a link to the repo root", () => {
+  const root = project();
+  apply(root, { log: quiet });
+  mkdirSync(join(root, "docs/agents"), { recursive: true });
+  writeFileSync(join(root, "docs/agents/issue-tracker.md"), "[the repo](../../) [also](../..) [adr](../adr/)\n");
+  setPaths(root, ["skillsConfigDir=agent-config"]);
+  apply(root, { log: quiet, migrate: true });
+  assert.equal(read(root, "agent-config/issue-tracker.md"), "[the repo](../) [also](..) [adr](../docs/adr/)\n");
+});
+
+test("Claude Code @imports follow moved artifacts", () => {
+  const root = project();
+  apply(root, { log: quiet });
+  mkdirSync(join(root, "docs/agents"), { recursive: true });
+  writeFileSync(join(root, "CONTEXT.md"), "# G\n");
+  writeFileSync(join(root, "docs/agents/domain.md"), "# D\n");
+  writeFileSync(join(root, "CLAUDE.md"), `${read(root, "CLAUDE.md")}@CONTEXT.md\nSee @docs/agents/domain.md, mail a@b.com, ask @alice.\n`);
+  setPaths(root, ["glossary=docs/GLOSSARY.md", "skillsConfigDir=agent-config"]);
+  assert.throws(() => apply(root, { log: quiet }), /\+ @docs\/GLOSSARY\.md/);
+  apply(root, { log: quiet, migrate: true });
+  const text = read(root, "CLAUDE.md");
+  assert.match(text, /^@docs\/GLOSSARY\.md$/m);
+  assert.match(text, /See @agent-config\/domain\.md, mail a@b\.com, ask @alice\./);
+});
+
+test("an invalid lock is refused before anything is deleted", () => {
+  const root = project();
+  apply(root, { log: quiet });
+  const lock = JSON.parse(read(root, LOCK_FILE));
+  lock.copies["../../outside"] = { skill: "x", originalHash: "", renderedHash: "", changed: [] };
+  writeFileSync(join(root, LOCK_FILE), JSON.stringify(lock));
+  assert.throws(() => apply(root, { log: quiet }), /invalid entry "\.\.\/\.\.\/outside"/);
+  lock.copies = { ".agents/skills/tdd": { skill: "tdd", originalHash: "", renderedHash: "", changed: ["../../../x"] } };
+  writeFileSync(join(root, LOCK_FILE), JSON.stringify(lock));
+  assert.throws(() => check(root), /invalid entry/);
+});
+
+test("broken JSON errors name the file", () => {
+  const root = project();
+  writeFileSync(join(root, "skills-lock.json"), "{ nope");
+  assert.throws(() => apply(root, { log: quiet }), /skills-lock\.json is not valid JSON/);
+  const root2 = project();
+  apply(root2, { log: quiet });
+  writeFileSync(join(root2, LOCK_FILE), "{");
+  assert.throws(() => check(root2), /skill-paths\.lock\.json is not valid JSON/);
+});
+
+test("cli: finds the project root from a subfolder and from the installed script", () => {
+  const root = project();
+  mkdirSync(join(root, "src/deep"), { recursive: true });
+  const installed = join(root, ".agents/skills", SELF, "scripts/configure.mjs");
+  const status = (cwd) => JSON.parse(execFileSync("node", [installed, "status"], { cwd, encoding: "utf8" }));
+  assert.equal(status(join(root, "src/deep")).configFile, CONFIG_FILE);
+  assert.equal(status(tmpdir()).skills.length, SOME.length);
+});

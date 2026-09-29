@@ -3,7 +3,9 @@
 // `npx skills add`. Driven by the configure-artifact-paths skill; also usable
 // by hand and in CI. Node 18.3+, no dependencies.
 
-import { resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { apply, check, setPaths, status } from "./lib/project.mjs";
 
@@ -26,7 +28,9 @@ apply options:
   --force             treat skills edited by hand as the original text
   --dry-run           print what would change, write nothing
 
-  --project DIR       project root (default: current directory)`;
+  --project DIR       project root (default: the nearest folder with a
+                      skills-lock.json, above the current directory or
+                      above this script)`;
 
 let parsed;
 try {
@@ -52,7 +56,21 @@ if (args.help || !command) {
   console.log(USAGE);
   process.exit(args.help ? 0 : 2);
 }
-const root = resolve(args.project ?? ".");
+// The project root: the nearest folder holding skills-lock.json, looking up
+// from the working directory (an agent may run from a subfolder), then up
+// from this script (installed at <root>/.agents/skills/<skill>/scripts/).
+function findRoot() {
+  const here = dirname(realpathSync(fileURLToPath(import.meta.url)));
+  for (const start of [process.cwd(), here]) {
+    for (let dir = resolve(start); ; dir = dirname(dir)) {
+      if (existsSync(join(dir, "skills-lock.json"))) return dir;
+      if (dirname(dir) === dir) break;
+    }
+  }
+  return process.cwd();
+}
+
+const root = args.project ? resolve(args.project) : findRoot();
 
 try {
   switch (command) {

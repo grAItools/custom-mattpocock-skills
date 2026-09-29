@@ -24,7 +24,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { CONFIG_FILE, LOCK_FILE, ORIGINALS_DIR, PATH_KEYS, checkTeachCollisions, defaultPaths, normalizePath, validateConfig } from "./paths.mjs";
 import { renderFiles } from "./render.mjs";
 
@@ -43,7 +43,13 @@ const ORIG_SUFFIX = ".orig";
 const NESTED_SKILL_BASES = [".posit/assistant/skills", ".tabnine/agent/skills"];
 const PLAIN_SKILL_BASES = ["skills", "agent/skills", "data/skills"];
 
-const readJson = (file) => JSON.parse(readFileSync(file, "utf8"));
+function readJson(file) {
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch (err) {
+    throw new Error(`${basename(file)} is not valid JSON (${err.message}); fix or restore it`);
+  }
+}
 const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const rel = (root, p) => relative(root, p).split(sep).join("/");
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -146,11 +152,25 @@ export function setPaths(root, assignments) {
 
 // A lock written before a path key existed has no value for it: the skills
 // then used that key's default. Keys that no longer exist are dropped.
+//
+// The lock names folders the script deletes and rewrites, so a hand-edited
+// or hostile one must not reach outside the skill folders.
+const COPY_KEY = new RegExp(
+  `^(?:\\.[^/]+/skills|${[...NESTED_SKILL_BASES, ...PLAIN_SKILL_BASES].map(escapeRe).join("|")})/[A-Za-z0-9._-]+$`,
+);
+const SAFE_REL = /^(?!\/)(?!.*(?:^|\/)\.\.?(?:\/|$))[^\0]+$/;
+
 export function loadLock(root) {
   const file = join(root, LOCK_FILE);
   if (!existsSync(file)) return null;
   const lock = readJson(file);
   if (!lock.copies) return null;
+  for (const [key, entry] of Object.entries(lock.copies)) {
+    const bad =
+      !COPY_KEY.test(key) || key.split("/").includes("..") ||
+      !Array.isArray(entry?.changed) || entry.changed.some((r) => typeof r !== "string" || !SAFE_REL.test(r));
+    if (bad) throw new Error(`${LOCK_FILE} has an invalid entry ${JSON.stringify(key)}; restore it from git or delete it and reinstall the skills`);
+  }
   const applied = lock.config?.paths ?? {};
   const paths = Object.fromEntries(
     Object.keys(PATH_KEYS).map((k) => [k, k in applied ? applied[k] : PATH_KEYS[k].default]),
@@ -228,14 +248,29 @@ function withOriginals(root, key, current, entry) {
   return [...byRel.values()].sort((a, b) => a.rel.localeCompare(b.rel));
 }
 
+// Every saved original for a copy, whatever the lock says.
+function savedOriginals(root, key) {
+  const dir = originalsDir(root, key);
+  if (!isKind(dir, "dir")) return [];
+  return readSkillDir(dir)
+    .filter((f) => f.rel.endsWith(ORIG_SUFFIX))
+    .map((f) => ({ rel: f.rel.slice(0, -ORIG_SUFFIX.length), content: f.content }));
+}
+
 // Classifies one installed copy and recovers its original files.
-//   configured: rendered by us and untouched since.
+//   configured: rendered by us, as the lock records, and untouched since.
 //   original:   straight from `npx skills`.
-//   modified:   edited after install or render. `rebuilt` is the best
-//               reconstruction: our saved originals for the files we
-//               changed, the current text for everything else.
-//   broken:     rendered by us, but saved originals are missing or edited.
-export function inspectCopy(root, skill, dir, lock) {
+//   unrecorded: rendered by us, but not as the lock records it (a run that
+//               stopped midway, or a lost lock). The saved originals rebuild
+//               exactly what `npx skills` installed, and every file is that
+//               original or a rendering of it: no hand edits.
+//   modified:   edited by hand. `rebuilt` is the best reconstruction; when
+//               `restorable`, it comes from our saved originals for the
+//               files we rewrote (current text elsewhere), so --force
+//               restores those files and `edited` names the hand edits it
+//               drops. Otherwise --force takes the current text as is.
+//   broken:     the lock records a render, but its saved originals are gone.
+export function inspectCopy(root, skill, dir, lock, paths) {
   const key = rel(root, dir);
   const current = readSkillDir(dir);
   const hash = folderHash(current);
@@ -250,23 +285,51 @@ export function inspectCopy(root, skill, dir, lock) {
   if (skill.computedHash && hash === skill.computedHash) {
     return { key, state: "original", current, original: current };
   }
+  const saved = savedOriginals(root, key);
+  if (saved.length && skill.computedHash) {
+    const rebuilt = withOriginals(root, key, current, { changed: saved.map((f) => f.rel) });
+    if (rebuilt && folderHash(rebuilt) === skill.computedHash) {
+      const renderings = [paths, lock?.config?.paths]
+        .filter(Boolean)
+        .map((p) => new Map(renderFiles(skill.name, rebuilt, p).files.map((f) => [f.rel, f.content])));
+      const edited = rebuilt
+        .filter((f) => {
+          const now = current.find((c) => c.rel === f.rel)?.content;
+          return !now || !(now.equals(f.content) || renderings.some((r) => r.get(f.rel)?.equals(now)));
+        })
+        .map((f) => f.rel);
+      return edited.length
+        ? { key, state: "modified", current, original: null, rebuilt, restorable: true, edited }
+        : { key, state: "unrecorded", current, original: rebuilt };
+    }
+  }
   if (entry) {
     const rebuilt = withOriginals(root, key, current, entry);
     return rebuilt
-      ? { key, state: "modified", current, original: null, rebuilt, entry }
+      ? { key, state: "modified", current, original: null, rebuilt, restorable: true, edited: droppedEdits(skill, current, rebuilt, entry.changed, lock.config.paths) }
       : { key, state: "broken", current, original: null };
   }
-  return { key, state: "modified", current, original: null, rebuilt: current };
+  return { key, state: "modified", current, original: null, rebuilt: current, restorable: false, edited: [] };
+}
+
+// Files --force would restore from their saved originals although their
+// current text is not just a rendering of them: hand edits it drops.
+function droppedEdits(skill, current, rebuilt, rels, paths) {
+  const rendered = new Map(renderFiles(skill.name, rebuilt, paths).files.map((f) => [f.rel, f.content]));
+  return rels.filter((r) => {
+    const now = current.find((f) => f.rel === r)?.content;
+    return !now || !now.equals(rendered.get(r));
+  });
 }
 
 // Installed copies of the managed skills with their state.
-function inspectAll(root, skills, lock) {
+function inspectAll(root, skills, lock, paths) {
   const copies = [];
   const missing = [];
   for (const skill of skills) {
     const found = candidateCopies(root, skill.name)
-      .map(({ dir, plain }) => ({ plain, ...inspectCopy(root, skill, dir, lock), skill, dir }))
-      .filter((c) => !c.plain || c.state === "configured" || c.state === "original" || lock?.copies?.[c.key]);
+      .map(({ dir, plain }) => ({ plain, ...inspectCopy(root, skill, dir, lock, paths), skill, dir }))
+      .filter((c) => !c.plain || ["configured", "original", "unrecorded"].includes(c.state) || lock?.copies?.[c.key]);
     if (!found.length) missing.push(skill.name);
     copies.push(...found);
   }
@@ -358,13 +421,14 @@ export function instructionFiles(root, paths) {
 
 // ---------------------------------------------------------------- migration
 
-// Path-shaped text in Markdown: code spans and link targets. References are
-// only ever rewritten inside these, never in prose.
-const PATH_SPANS = /`([^`\n]+)`|\]\(([^)\s]+)\)/g;
+// Path-shaped text in Markdown: code spans, link targets, and Claude Code
+// `@path` imports (a word starting with `@`, outside code spans). References
+// are only ever rewritten inside these, never in prose.
+const PATH_SPANS = /`([^`\n]+)`|\]\(([^)\s]+)\)|(?<=^|\s)@([A-Za-z0-9._~/-][^\s`)]*)/gm;
 
-function mapSpans(text, onCode, onLink = onCode) {
-  return text.replace(PATH_SPANS, (m, code, link) =>
-    code !== undefined ? `\`${onCode(code)}\`` : `](${onLink(link)})`,
+function mapSpans(text, onCode, onLink = onCode, onImport = (t) => t) {
+  return text.replace(PATH_SPANS, (m, code, link, imp) =>
+    code !== undefined ? `\`${onCode(code)}\`` : link !== undefined ? `](${onLink(link)})` : `@${onImport(imp)}`,
   );
 }
 
@@ -486,16 +550,19 @@ function changedLines(before, after) {
 function rewriteLink(root, target, oldDir, newDir, rewrite) {
   if (isExternal(target)) return target;
   const [path, hash = ""] = target.split(/(?=#)/);
-  const slash = path.endsWith("/") ? "/" : "";
+  const slash = path.endsWith("/");
   const abs = resolve(oldDir, path);
   const inRepo = abs === root || isInside(abs, root);
-  const repoRel = inRepo ? `${rel(root, abs)}${slash}` : null;
+  // The repo root itself is "."; never an empty or absolute path.
+  const repoRel = inRepo ? `${rel(root, abs) || "."}${slash && abs !== root ? "/" : ""}` : null;
   const rewritten = repoRel === null ? null : rewrite(repoRel);
   if (oldDir === newDir && rewritten === repoRel) return target;
   const newAbs = rewritten === null ? abs : resolve(root, rewritten);
   let next = relative(newDir, newAbs).split(sep).join("/") || ".";
-  if (!next.startsWith("../") && next !== ".") next = `./${next}`;
-  return `${next}${(rewritten ?? path).endsWith("/") && next !== "." ? "/" : ""}${hash}`;
+  // Keep the link's own style: `./` only where it had one.
+  if (path.startsWith("./") && !next.startsWith("../") && next !== ".") next = `./${next}`;
+  const trailing = (slash || rewritten?.endsWith("/")) && !next.endsWith("/") ? "/" : "";
+  return `${next}${trailing}${hash}`;
 }
 
 // References to moved paths in the files known to hold them: the
@@ -548,7 +615,10 @@ export function planReferenceRewrites(root, oldPaths, newPaths) {
         ? [before.slice(0, start), before.slice(start, end), before.slice(end)]
         : [before, "", ""];
     const onLink = (target) => rewriteLink(root, target, oldDir, newDir, rewrite);
-    const after = mapSpans(head, rewrite, onLink) + block + mapSpans(tail, rewrite, onLink);
+    // Claude Code resolves `@path` imports against the file holding them;
+    // only the instruction files at the root use them.
+    const onImport = [join(root, "AGENTS.md"), join(root, "CLAUDE.md")].map(realpathOrNull).includes(real) ? onLink : undefined;
+    const after = mapSpans(head, rewrite, onLink, onImport) + block + mapSpans(tail, rewrite, onLink, onImport);
     if (after !== before) rewrites.push({ file, after, lines: changedLines(before, after) });
   }
   return rewrites;
@@ -570,7 +640,7 @@ export function status(root) {
   const { exists: configExists, config } = loadConfig(root);
   const lock = loadLock(root);
   const skills = managedSkills(root);
-  const { copies } = inspectAll(root, skills, lock);
+  const { copies } = inspectAll(root, skills, lock, config.paths);
   const defaults = defaultPaths();
   return {
     configFile: CONFIG_FILE,
@@ -609,7 +679,7 @@ export function apply(root, opts = {}) {
   const lock = loadLock(root);
   const skills = managedSkills(root);
   if (skills.some((s) => s.name === "teach")) checkTeachCollisions(config.paths);
-  const { copies, missing } = inspectAll(root, skills, lock);
+  const { copies, missing } = inspectAll(root, skills, lock, config.paths);
   for (const name of missing) log(`skip ${name}: listed in ${SKILLS_LOCK} but not installed`);
 
   // Recover every copy's original text before touching anything.
@@ -620,22 +690,15 @@ export function apply(root, opts = {}) {
       blocked.push(
         c.state === "broken"
           ? `${c.key}: its saved originals under ${ORIGINALS_DIR} are missing or edited; reinstall it:`
-          : `${c.key}: edited since it was installed; reinstall it, or pass --force:`,
+          : c.restorable
+            ? `${c.key}: edited since it was configured; reinstall it, or pass --force to restore the files this script rewrote from their saved originals (edits elsewhere are kept):`
+            : `${c.key}: edited, and never configured here; reinstall it (--force would take its current text, edits and all, as the original):`,
         `    npx skills add ${c.skill.source ?? "<source>"} --skill ${c.skill.name} --agent <the agents you installed for> -y${c.key.startsWith(".agents/") ? "" : " --copy"}`,
       );
       continue;
     }
-    // Files we rendered come back from their saved originals, so hand edits
-    // to them are lost: say which.
-    if (c.entry) {
-      const lost = c.entry.changed.filter((r) => {
-        const now = c.current.find((f) => f.rel === r);
-        const orig = c.rebuilt.find((f) => f.rel === r);
-        const expected = renderFiles(c.skill.name, [orig], lock.config.paths).files[0];
-        return !now || !now.content.equals(expected.content);
-      });
-      if (lost.length) log(`warning: --force drops edits to ${lost.map((r) => `${c.key}/${r}`).join(", ")}`);
-    }
+    if (c.edited.length) log(`warning: --force drops edits to ${c.edited.map((r) => `${c.key}/${r}`).join(", ")}`);
+    if (!c.restorable) log(`warning: --force takes the current text of ${c.key} as its original`);
     c.original = c.rebuilt;
   }
   if (blocked.length) {
@@ -684,41 +747,72 @@ export function apply(root, opts = {}) {
 
   if (!configExists) act(`write ${CONFIG_FILE}`, () => writeConfig(root, config));
 
-  const lockCopies = {};
-  for (const c of copies) {
+  // Plan every copy first.
+  const plans = copies.map((c) => {
     const { files: rendered } = renderFiles(c.skill.name, c.original, config.paths);
     const byRel = new Map(c.original.map((f) => [f.rel, f.content]));
-    const changed = rendered.filter((f) => !f.content.equals(byRel.get(f.rel))).map((f) => f.rel);
     const currentByRel = new Map(c.current.map((f) => [f.rel, f.content]));
-    const toWrite = rendered.filter((f) => !f.content.equals(currentByRel.get(f.rel)));
+    const changed = rendered.filter((f) => !f.content.equals(byRel.get(f.rel))).map((f) => f.rel);
+    return {
+      c,
+      changed,
+      toWrite: rendered.filter((f) => !f.content.equals(currentByRel.get(f.rel))),
+      wanted: new Map(changed.map((r) => [r + ORIG_SUFFIX, byRel.get(r)])),
+      entry: {
+        skill: c.skill.name,
+        originalHash: folderHash(c.original),
+        renderedHash: folderHash(rendered),
+        changed,
+      },
+    };
+  });
+  const lockCopies = Object.fromEntries(plans.map((p) => [p.c.key, p.entry]));
+  const nextLock = { version: 2, generatedBy: `${SELF}/scripts/configure.mjs`, config, copies: lockCopies };
+
+  // Write in an order a stopped run can recover from: saved originals are
+  // only added until the end, so the text `npx skills` installed can always
+  // be rebuilt, whichever of the skills and the lock got written.
+  for (const { c, wanted } of plans) {
+    const origDir = originalsDir(root, c.key);
+    const missingOrig = [...wanted].filter(([r, content]) => {
+      const file = join(origDir, ...r.split("/"));
+      return !existsSync(file) || !readFileSync(file).equals(content);
+    });
+    if (missingOrig.length) {
+      act(`save originals of ${c.key} (${missingOrig.length} file${missingOrig.length === 1 ? "" : "s"})`, () => {
+        for (const [r, content] of missingOrig) {
+          const out = join(origDir, ...r.split("/"));
+          mkdirSync(dirname(out), { recursive: true });
+          writeFileSync(out, content);
+        }
+      });
+    }
+  }
+  for (const { c, toWrite } of plans) {
     if (toWrite.length) {
       act(`render ${c.key} (${toWrite.length} file${toWrite.length === 1 ? "" : "s"})`, () => {
         for (const f of toWrite) writeFileSync(join(c.dir, ...f.rel.split("/")), f.content);
       });
     }
-    lockCopies[c.key] = {
-      skill: c.skill.name,
-      originalHash: folderHash(c.original),
-      renderedHash: folderHash(rendered),
-      changed,
-    };
-    // Rewrite the saved originals only when they differ from what is there.
+  }
+  if (!sameJson(nextLock, lock)) {
+    act(`write ${LOCK_FILE}`, () => {
+      mkdirSync(dirname(join(root, LOCK_FILE)), { recursive: true });
+      writeFileSync(join(root, LOCK_FILE), `${JSON.stringify(nextLock, null, 2)}\n`);
+    });
+  }
+  // Now drop saved originals nothing needs: stale ones, and those of copies
+  // that are gone (e.g. `npx skills remove`).
+  for (const { c, wanted } of plans) {
     const origDir = originalsDir(root, c.key);
-    const saved = existsSync(origDir) ? readSkillDir(origDir) : [];
-    const wanted = changed.map((r) => ({ rel: r + ORIG_SUFFIX, content: byRel.get(r) }));
-    if (folderHash(saved) !== folderHash(wanted) || saved.length !== wanted.length) {
-      act(`save originals of ${c.key} (${changed.length} file${changed.length === 1 ? "" : "s"})`, () => {
-        rmSync(origDir, { recursive: true, force: true });
-        for (const w of wanted) {
-          const out = join(origDir, ...w.rel.split("/"));
-          mkdirSync(dirname(out), { recursive: true });
-          writeFileSync(out, w.content);
-        }
+    const stale = isKind(origDir, "dir") ? readSkillDir(origDir).filter((f) => !wanted.has(f.rel)) : [];
+    if (stale.length) {
+      act(`drop ${stale.length} unneeded original${stale.length === 1 ? "" : "s"} of ${c.key}`, () => {
+        for (const f of stale) rmSync(join(origDir, ...f.rel.split("/")));
+        if (!wanted.size) rmSync(origDir, { recursive: true, force: true });
       });
     }
   }
-
-  // Forget copies that are gone (e.g. `npx skills remove`).
   for (const key of Object.keys(lock?.copies ?? {})) {
     if (!lockCopies[key]) {
       act(`forget ${key}`, () => rmSync(originalsDir(root, key), { recursive: true, force: true }));
@@ -727,14 +821,6 @@ export function apply(root, opts = {}) {
 
   for (const f of instructionFiles(root, config.paths)) {
     if (f.before !== f.after) act(`update ${rel(root, f.path)}`, () => writeFileSync(f.path, f.after));
-  }
-
-  const nextLock = { version: 2, generatedBy: `${SELF}/scripts/configure.mjs`, config, copies: lockCopies };
-  if (!sameJson(nextLock, lock)) {
-    act(`write ${LOCK_FILE}`, () => {
-      mkdirSync(dirname(join(root, LOCK_FILE)), { recursive: true });
-      writeFileSync(join(root, LOCK_FILE), `${JSON.stringify(nextLock, null, 2)}\n`);
-    });
   }
   return nextLock;
 }
@@ -756,11 +842,13 @@ export function check(root) {
   if (!sameJson(config, lock.config)) {
     problems.push(`${CONFIG_FILE} changed since the paths were applied: run /configure-artifact-paths`);
   }
-  const { copies } = inspectAll(root, managedSkills(root), lock);
+  const { copies } = inspectAll(root, managedSkills(root), lock, config.paths);
   for (const c of copies) {
     if (c.state === "configured") continue;
     if (c.state === "original") {
       problems.push(`${c.key} has the upstream paths (installed or updated by \`npx skills\`): run /configure-artifact-paths`);
+    } else if (c.state === "unrecorded") {
+      problems.push(`${c.key} was rendered but the lock does not record it (an interrupted run?): run /configure-artifact-paths`);
     } else if (c.state === "broken") {
       problems.push(`${c.key}: its saved originals under ${ORIGINALS_DIR} are missing or edited`);
     } else {

@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 The skills installed from this repo name default locations for the files they write (`CONTEXT.md`, `docs/adr/`, `.scratch/`, ...). This skill lets the user pick other locations and rewrites the installed skills in place so every agent reads the chosen paths.
 
-All the work is done by `scripts/configure.mjs` in this skill's folder (the folder holding this `SKILL.md`, usually `.agents/skills/configure-artifact-paths/`). Run it with `node` from the project root. It needs Node 18.3 or later and nothing else. Below, `configure.mjs` means that script.
+All the work is done by `scripts/configure.mjs` in this skill's folder (the folder holding this `SKILL.md`, usually `.agents/skills/configure-artifact-paths/`). Run it with `node`; it finds the project root (the nearest folder with `skills-lock.json`) from the working directory or from its own location, and `--project DIR` overrides that. It needs Node 18.3 or later and nothing else. Below, `configure.mjs` means that script.
 
 Never edit the installed skills or the generated `Artifact locations` block in `AGENTS.md` by hand: the script owns them.
 
@@ -20,7 +20,7 @@ Run `node <skill folder>/scripts/configure.mjs status`. It prints JSON with:
 
 - `paths`: for each key, the configured `value`, its `default`, a `label`, what it is `relativeTo`, and whether it is `optional` (optional keys default to `null`, meaning "keep the skill's own convention").
 - `appliedPaths`: the paths the skills were last rewritten with, or `null` if never.
-- `skills`: each installed skill from this repo and the `state` of each copy: `configured` (matches the lock), `original` (fresh from `npx skills`, still on default paths), `modified` (edited by hand), or `broken`.
+- `skills`: each installed skill from this repo and the `state` of each copy: `configured` (matches the lock), `original` (fresh from `npx skills`, still on default paths), `unrecorded` (rendered by an earlier run that stopped, or whose lock was lost; `apply` recovers it by itself), `modified` (edited by hand), or `broken`.
 
 If it fails because `skills-lock.json` or this skill is missing from it, tell the user to install the skills into this project with `npx skills add` first, and stop.
 
@@ -43,7 +43,7 @@ Run `node <skill folder>/scripts/configure.mjs apply`. It rewrites the installed
 It stops, changing nothing, in two cases. Show the user what it printed and ask:
 
 - **Existing artifacts at the previous locations** (paths changed since the last apply; on the first apply, the previous locations are the upstream defaults, so a project that already has `CONTEXT.md` or `docs/adr/` lands here): move them (`--migrate`, which uses `git mv` for tracked files and updates path references in `AGENTS.md`, `CLAUDE.md`, the context map and the setup config; the message shows each line it would change) or leave them (`--skip-migration`)? Re-run `apply` with the chosen flag. Lines starting `cannot migrate:` (a destination that already exists, a folder moved into itself, two moves that overlap) block `--migrate`: the user resolves them by hand or changes one path at a time. A moved teaching workspace is always moved by hand.
-- **A skill edited by hand**: reinstall it with the `npx skills add` command the message prints (ask the user which agents they installed for, and repeat those `--agent` flags, plus `--copy` if the message shows it) and re-run `apply`, or re-run with `--force`. With `--force`, files the script had rewritten come back from their saved originals (their hand edits are dropped, and it names them); hand edits elsewhere are kept. A skill whose saved originals are missing must be reinstalled.
+- **A skill edited by hand**: reinstall it with the `npx skills add` command the message prints (ask the user which agents they installed for, and repeat those `--agent` flags, plus `--copy` if the message shows it) and re-run `apply`, or re-run with `--force`. Follow the message: when it offers to restore from saved originals, `--force` brings back the files the script had rewritten (dropping the hand edits it names) and keeps edits elsewhere; when it says the copy was never configured here, recommend reinstalling, because `--force` would take the edited text as the original. A skill whose saved originals are missing must be reinstalled.
 
 ### 5. Finish
 
