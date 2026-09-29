@@ -1,0 +1,33 @@
+name: Installer
+
+# Fork-only: keeps /configure-artifact-paths in step with upstream skills.
+# A failing guard after an upstream merge means a rewrite rule in
+# skills/fork/configure-artifact-paths/scripts/lib/rules.mjs needs updating.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  installer:
+    name: Tests and upstream-sync guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Tests
+        run: node --test installer/test/*.test.mjs
+
+      - name: Guard
+        run: node installer/guard.mjs
+
+      - name: Real npx skills round trip
+        run: node --test --test-name-pattern="real npx skills" installer/test/*.test.mjs
+        env:
+          REAL_SKILLS_CLI: "1"
