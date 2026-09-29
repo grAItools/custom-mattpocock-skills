@@ -10,13 +10,21 @@ name: Upstream sync
 #   check:   no write token at all. Merges, records the merge commit before
 #            running anything, then runs the checks and hands the commit over
 #            as a git bundle.
-#   publish: holds the App token and never executes anything from the tree.
-#            It pushes only the commit `check` recorded, after verifying it.
+#   publish: holds the SYNC_PAT token and never executes anything from the
+#            tree. It pushes only the commit `check` recorded, after
+#            verifying it.
+# A third job, verify, runs only on request (Run workflow, "verify") and
+# checks the token setup without syncing anything.
 
 on:
   schedule:
     - cron: "17 */6 * * *" # every 6 hours: the 24h bound survives delays and a failed run
   workflow_dispatch:
+    inputs:
+      verify:
+        description: "Only verify the setup (SYNC_ENABLED, SYNC_PAT and its permissions); sync nothing"
+        type: boolean
+        default: false
 
 concurrency:
   group: upstream-sync
@@ -32,8 +40,9 @@ env:
 
 jobs:
   check:
-    # Inert until the GitHub App is set up (the SYNC_APP_ID variable exists).
-    if: vars.SYNC_APP_ID != ''
+    # Inert until set up (the SYNC_ENABLED variable is true), and skipped by
+    # a verify run.
+    if: vars.SYNC_ENABLED == 'true' && !inputs.verify
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -151,11 +160,11 @@ jobs:
     # Runs after a failed check too, to report it, and when up to date, to
     # close a report left open by a sync someone finished by hand.
     if: >-
-      !cancelled() && vars.SYNC_APP_ID != '' && needs.check.result != 'skipped'
+      !cancelled() && vars.SYNC_ENABLED == 'true' && needs.check.result != 'skipped'
     runs-on: ubuntu-latest
-    # The App's private key lives in this environment, whose deployment
-    # branch policy allows only main (installer/README.md, setup step 2), so
-    # no workflow on another branch can read it.
+    # SYNC_PAT lives in this environment, whose deployment branch policy
+    # allows only main (installer/README.md, "One-time setup"), so no
+    # workflow on another branch can read it.
     environment: upstream-sync
     permissions:
       contents: read
@@ -170,17 +179,6 @@ jobs:
       CHECKS_OK: ${{ needs.check.result == 'success' }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
-      # A GitHub App token, not GITHUB_TOKEN: pushes and PRs made with it
-      # trigger the fork's own workflows. The App deliberately lacks the
-      # Workflows permission, so GitHub itself refuses any push of commits
-      # that change workflow files.
-      - name: App token
-        id: app
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
-        with:
-          app-id: ${{ vars.SYNC_APP_ID }}
-          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
-
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: main
@@ -200,7 +198,11 @@ jobs:
         id: push
         if: env.HEAD_SHA != ''
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
+          # A fine-grained PAT, not GITHUB_TOKEN: pushes and PRs made with it
+          # trigger the fork's own workflows. It deliberately lacks the
+          # Workflows permission, so GitHub itself refuses any push of
+          # commits that change workflow files.
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
         run: |
           if [ "$BUNDLED" = true ]; then
             git fetch -q "$RUNNER_TEMP/sync.bundle" HEAD
@@ -260,7 +262,7 @@ jobs:
         id: pr
         if: steps.push.outputs.pushed == 'true'
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
           TOUCHES_PROTECTED: ${{ steps.push.outputs.touches_protected }}
         run: |
           title="Sync upstream mattpocock/skills@${TARGET:0:7}"
@@ -324,7 +326,7 @@ jobs:
       - name: Report
         if: ${{ !cancelled() }}
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
           UP_TO_DATE_CONFIRMED: ${{ steps.current.outputs.confirmed }}
           AUTO_WAS_ON: ${{ steps.push.outputs.auto_was_on }}
           PUSHED: ${{ steps.push.outcome }}
@@ -411,3 +413,117 @@ jobs:
             gh issue create --title "Upstream sync needs attention" --label upstream-sync --body "$body"
           fi
           exit 1
+
+  verify:
+    # On request only: checks the setup without syncing anything. Run it
+    # after creating or renewing SYNC_PAT. Its only lasting effects are the
+    # `upstream-sync` label (which the sync creates anyway) and a no-op edit
+    # of the latest PR's title.
+    if: inputs.verify
+    runs-on: ubuntu-latest
+    environment: upstream-sync
+    permissions:
+      contents: read
+    env:
+      SYNC_ENABLED: ${{ vars.SYNC_ENABLED }}
+      GH_TOKEN: ${{ secrets.SYNC_PAT }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Verify the setup
+        run: |
+          failed=0
+          pass() { echo "PASS: $*" | tee -a "$GITHUB_STEP_SUMMARY"; }
+          fail() { echo "FAIL: $*" | tee -a "$GITHUB_STEP_SUMMARY"; failed=1; }
+          note() { echo "NOTE: $*" | tee -a "$GITHUB_STEP_SUMMARY"; }
+          repo="$GITHUB_REPOSITORY"
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${repo}.git"
+
+          if [ "$SYNC_ENABLED" = true ]; then pass "variable SYNC_ENABLED is true"
+          else fail "variable SYNC_ENABLED is '${SYNC_ENABLED}', not 'true' (repository variables)"; fi
+
+          if [ -z "$GH_TOKEN" ]; then
+            fail "SYNC_PAT is not readable: add it as a secret of the upstream-sync environment"
+            exit 1
+          fi
+          pass "SYNC_PAT is readable in the upstream-sync environment from ${GITHUB_REF_NAME}"
+
+          # Repository access (also fails while an org approval is pending, or
+          # when single sign-on authorization is missing).
+          if head=$(gh api -i "repos/$repo" 2>&1); then
+            pass "the token can read $repo (as $(gh api user -q .login 2>/dev/null || echo 'its owner'))"
+          else
+            fail "the token cannot read $repo: $(tail -n 1 <<< "$head")"
+            exit 1
+          fi
+          expiry=$(grep -i '^github-authentication-token-expiration:' <<< "$head" | cut -d: -f2- | xargs || true)
+          if [ -z "$expiry" ]; then
+            note "the token reports no expiry date"
+          else
+            days=$(( ($(date -d "$expiry" +%s) - $(date +%s)) / 86400 ))
+            if [ "$days" -lt 30 ]; then fail "the token expires in $days days ($expiry): renew it"
+            else pass "the token expires in $days days ($expiry)"; fi
+          fi
+
+          # Contents: write. A dry run authenticates the push without sending it.
+          if git push --dry-run -q "$remote" "HEAD:refs/heads/upstream-sync-verify" 2>/dev/null; then
+            pass "Contents: write"
+          else
+            fail "Contents: write is missing"
+          fi
+
+          # Workflows: must be absent, so GitHub refuses pushes that change
+          # workflow files. Try one to a throwaway branch.
+          git config user.name "upstream-sync verify"
+          git config user.email "upstream-sync-verify@users.noreply.github.com"
+          echo "# verify ${GITHUB_RUN_ID}" >> .github/workflows/installer.yml
+          git commit -qam "verify: must be refused"
+          if out=$(git push -q "$remote" "HEAD:refs/heads/upstream-sync-verify-${GITHUB_RUN_ID}" 2>&1); then
+            git push -q "$remote" --delete "upstream-sync-verify-${GITHUB_RUN_ID}" || true
+            fail "Workflows permission is granted: remove it, so GitHub refuses workflow changes"
+          elif grep -qi workflow <<< "$out"; then
+            pass "Workflows: no access (GitHub refused a workflow change)"
+          else
+            fail "the workflow-change push failed for another reason: $(tail -n 1 <<< "$out")"
+          fi
+
+          # Issues: write, by creating (or updating) the label the sync uses.
+          if gh label create upstream-sync --force --color d93f0b \
+               --description "Reports from the Upstream sync workflow" >/dev/null 2>&1; then
+            pass "Issues: write"
+          else
+            fail "Issues: write is missing"
+          fi
+
+          # Pull requests: write, by re-setting the latest PR's title to itself.
+          number=$(gh pr list --state all --limit 1 --json number -q '.[0].number')
+          if [ -z "$number" ]; then
+            note "no pull request exists yet to test Pull requests: write"
+          elif gh api -X PATCH "repos/$repo/pulls/$number" \
+                 -f title="$(gh pr view "$number" --json title -q .title)" >/dev/null 2>&1; then
+            pass "Pull requests: write"
+          else
+            fail "Pull requests: write is missing"
+          fi
+
+          # Repository settings the sync relies on (readable with this token).
+          settings=$(gh api "repos/$repo" -q '[.allow_auto_merge, .allow_merge_commit, .delete_branch_on_merge] | map(tostring) | join(" ")')
+          read -r auto_merge merge_commit delete_branch <<< "$settings"
+          if [ "$auto_merge" = true ]; then pass "Allow auto-merge is on"
+          else fail "Allow auto-merge is off (Settings, General)"; fi
+          if [ "$merge_commit" != false ]; then pass "merge commits are allowed"
+          else fail "merge commits are not allowed (Settings, General)"; fi
+          if [ "$delete_branch" = true ]; then pass "head branches are deleted after merging"
+          else note "Automatically delete head branches is off (Settings, General)"; fi
+          rules=$(gh api "repos/$repo/rules/branches/main" 2>/dev/null || echo '[]')
+          if jq -e 'any(.[]; .type == "required_status_checks" and .parameters.strict_required_status_checks_policy == true
+                     and any(.parameters.required_status_checks[]; .context == "Tests and upstream-sync guard"))' <<< "$rules" >/dev/null; then
+            pass "a ruleset on main requires \"Tests and upstream-sync guard\" on up-to-date branches"
+          else
+            note "no ruleset on main requires \"Tests and upstream-sync guard\" on up-to-date branches (classic branch protection is not visible to this check)"
+          fi
+
+          exit "$failed"
+
