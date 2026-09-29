@@ -209,10 +209,14 @@ jobs:
             # Nothing new: the checked commit is the sync branch as it is.
             test "$(git rev-parse "origin/$SYNC_BRANCH")" = "$HEAD_SHA"
           fi
-          # It must contain the main and the upstream commit it was checked
-          # against, and every new commit must be either upstream's own or a
-          # clean merge whose tree git reproduces here: nothing else can have
-          # been slipped in.
+          # The main and upstream commits it was checked against must really
+          # be this repo's main and upstream's (not taken on the check job's
+          # word), the head must contain both, and every new commit must be
+          # either upstream's own or a clean merge whose tree git reproduces
+          # here: nothing else can have been slipped in.
+          git merge-base --is-ancestor "$BASE" main
+          git fetch -q --no-tags "$UPSTREAM_URL" "$UPSTREAM_REF"
+          git merge-base --is-ancestor "$TARGET" FETCH_HEAD
           git merge-base --is-ancestor "$BASE" "$HEAD_SHA"
           git merge-base --is-ancestor "$TARGET" "$HEAD_SHA"
           known=(^"$BASE")
@@ -240,7 +244,7 @@ jobs:
           fi
           # Before the head changes, switch off an auto-merge left from an
           # earlier run: the PR step enables it again only for an eligible
-          # head, which also restarts its 12-hour timer. Errors stop the run.
+          # head. Errors stop the run.
           if [ "$(git rev-parse -q --verify "origin/$SYNC_BRANCH" || true)" != "$HEAD_SHA" ] &&
              [ "$(gh pr list --head "$SYNC_BRANCH" --state open --json autoMergeRequest \
                   -q '.[0].autoMergeRequest != null')" = true ]; then
@@ -286,8 +290,7 @@ jobs:
             echo "state=main-moved" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Auto-merge already on for this exact head: leave it, so its timer
-          # (reported after 12 hours) keeps running.
+          # Auto-merge already on for this exact head: leave it on.
           if [ "$(gh pr view "$SYNC_BRANCH" --json autoMergeRequest,headRefOid \
                   -q '(.autoMergeRequest != null) and (.headRefOid == "'"$HEAD_SHA"'")')" = true ]; then
             echo "state=auto" >> "$GITHUB_OUTPUT"
@@ -337,11 +340,14 @@ jobs:
             echo "main moved during the run; the next run merges it and checks again." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           elif [ "$PR_STATE" = auto ]; then
-            if [ "$(gh pr view "$SYNC_BRANCH" --json autoMergeRequest \
-                    -q '.autoMergeRequest.enabledAt | fromdateiso8601 < (now - 43200)')" != true ]; then
+            # Timed from the PR's creation, which new heads do not reset: a
+            # PR that can never auto-merge must not stay silent while
+            # upstream keeps moving.
+            if [ "$(gh pr view "$SYNC_BRANCH" --json createdAt \
+                    -q '.createdAt | fromdateiso8601 < (now - 86400)')" != true ]; then
               exit 0 # waiting on the required check
             fi
-            code=stalled; reason="The sync PR has waited on auto-merge for over 12 hours: a required review or check is not being satisfied."
+            code=stalled; reason="The sync PR has been open for over 24 hours, waiting on auto-merge: a required review or check is not being satisfied."
           else
             code=merge; reason="Checks passed but the sync PR could not be merged: check that auto-merge is allowed and that main does not require an approving review."
           fi
@@ -353,8 +359,10 @@ jobs:
             if [ -n "$existing" ]; then
               gh issue close "$existing" --comment "main now contains upstream \`${TARGET}\`. ${RUN_URL}"
             fi
+            # (as an ancestor, or with the same tree after a by-hand merge).
             if [ "$(gh pr view "$SYNC_BRANCH" --json state -q .state 2>/dev/null)" = OPEN ] &&
-               git merge-base --is-ancestor "origin/$SYNC_BRANCH" main; then
+               { git merge-base --is-ancestor "origin/$SYNC_BRANCH" main ||
+                 git diff --quiet main "origin/$SYNC_BRANCH"; }; then
               gh pr close "$SYNC_BRANCH" --delete-branch --comment "main already contains this branch. ${RUN_URL}"
             fi
             exit 0
