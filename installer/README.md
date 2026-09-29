@@ -81,7 +81,9 @@ When paths change and artifacts already exist at the previous ones, `apply` stop
 
 So upstream code runs only where there is no token to steal, and what lands is exactly what was checked.
 
-Everything else is reported on a single issue labelled `upstream-sync`, one comment per upstream commit and reason: a merge conflict (with upstream, or between `main` and the open sync branch), a failing check, a protected path changed, a PR that could not be merged, or a PR that has waited on auto-merge for over 12 hours. The issue is closed with a comment when a later sync goes through. A run that needs attention also ends red, so GitHub notifies you.
+It merges only onto the `main` the checks ran against: if `main` moved during the run, it leaves the PR alone and the next run merges `main` into the branch and checks again.
+
+Everything else is reported on a single issue labelled `upstream-sync`, one comment per upstream commit and reason: a merge conflict (with upstream, or between `main` and the open sync branch), a merge that failed for another reason (such as rewritten upstream history), a failing check, a protected path changed, a PR that could not be merged, or auto-merge enabled for over 12 hours without merging. A run that needs attention also ends red, so GitHub notifies you. The issue is closed as soon as `main` contains upstream, whether the sync merged itself or you finished it by hand.
 
 ### One-time setup
 
@@ -90,12 +92,13 @@ Until `SYNC_APP_ID` exists both jobs are skipped, so the workflow is harmless be
 1. **Create a GitHub App** (Settings, Developer settings, GitHub Apps, New). No webhook. Repository permissions: *Contents*, *Pull requests*, *Issues* and *Workflows*, all read and write. Install it on this repository only.
 2. **Store its credentials** in this repository (Settings, Secrets and variables, Actions): the App ID as the variable `SYNC_APP_ID`, a generated private key as the secret `SYNC_APP_PRIVATE_KEY`.
 3. **Allow auto-merge**: Settings, General, Pull Requests, "Allow auto-merge".
-4. **Protect `main`** with a ruleset or branch protection that requires the status check "Tests and upstream-sync guard" (recommended). Auto-merge then waits for it. Do **not** require an approving review: the App cannot approve, so auto-merge would wait forever (the workflow reports that after 12 hours). Without protection the workflow merges at once, but only while `main` has not moved since the checks, so the merged tree is exactly the one checked; otherwise the next run retries.
-5. **Run it once by hand** (Actions, Upstream sync, Run workflow) and check the run: with nothing new upstream it reports "Up to date".
+4. **Protect `main`** with a ruleset or branch protection that requires the status check "Tests and upstream-sync guard" **and requires branches to be up to date before merging** (strict). Auto-merge then waits for the check, and cannot merge the PR onto a newer `main` it was not checked against; the next run brings the branch up to date and checks again. Do **not** require an approving review: the App cannot approve, so auto-merge would wait forever (the workflow reports that after 12 hours). Without protection the workflow merges at once, but only onto the `main` it checked; a commit landing on `main` in the seconds between that comparison and the merge is the one gap protection closes.
+5. **Let head branches be deleted after merging** (Settings, General, Pull Requests, "Automatically delete head branches"), and merge sync PRs you merge by hand with a merge commit. A squash or rebase merge leaves the old `upstream-sync` branch looking unmerged, and the next run would build on it.
+6. **Run it once by hand** (Actions, Upstream sync, Run workflow) and check the run: with nothing new upstream it reports "Up to date".
 
 GitHub may delay scheduled runs, and in a public repository disables scheduled workflows after 60 days without activity (it emails you; re-enable it from the Actions tab). If the App token cannot be created (wrong ID or key), the run fails before it can open an issue: the red run is the only signal.
 
-To drop a sync PR, close it **and delete the `upstream-sync` branch**; otherwise the next run builds on the branch and reopens it. The workflow always proposes the latest upstream `main`: to hold upstream back for a while, disable the workflow from the Actions tab.
+To drop a sync PR, close it **and delete the `upstream-sync` branch**; otherwise the next run builds on the branch and reopens it. The workflow sets the PR's title and body only when the upstream commit changes, so edits you make to them stay until then. The workflow always proposes the latest upstream `main`: to hold upstream back for a while, disable the workflow from the Actions tab.
 
 ### By hand
 

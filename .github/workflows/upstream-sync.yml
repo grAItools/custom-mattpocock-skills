@@ -80,14 +80,17 @@ jobs:
         run: |
           git config user.name "upstream-sync[bot]"
           git config user.email "upstream-sync[bot]@users.noreply.github.com"
+          # A failed merge: a conflict with `$1` (main or upstream), or an
+          # error with no conflicted files (e.g. rewritten upstream history).
           conflicted() {
+            files=$(git diff --name-only --diff-filter=U)
             {
-              echo "conflict=$1"
+              if [ -n "$files" ]; then echo "conflict=$1"; else echo "conflict=error"; fi
               echo "conflicts<<EOF"
-              git diff --name-only --diff-filter=U
+              echo "$files"
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
-            git merge --abort
+            git merge --abort 2>/dev/null || true
             exit 1
           }
           # Build on an open sync branch, so fixes pushed to it survive;
@@ -152,16 +155,17 @@ jobs:
 
   publish:
     needs: check
-    # Runs after a failed check too, to report it; nothing to do when up to date.
+    # Runs after a failed check too, to report it, and when up to date, to
+    # close a report left open by a sync someone finished by hand.
     if: >-
-      !cancelled() && vars.SYNC_APP_ID != '' &&
-      needs.check.result != 'skipped' && needs.check.outputs.up_to_date != 'true'
+      !cancelled() && vars.SYNC_APP_ID != '' && needs.check.result != 'skipped'
     runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
       TARGET: ${{ needs.check.outputs.target }}
       BASE: ${{ needs.check.outputs.base }}
+      UP_TO_DATE: ${{ needs.check.outputs.up_to_date }}
       HEAD_SHA: ${{ needs.check.outputs.head }}
       BUNDLED: ${{ needs.check.outputs.bundled }}
       CONFLICT: ${{ needs.check.outputs.conflict }}
@@ -224,7 +228,11 @@ jobs:
           title="Sync upstream mattpocock/skills@${TARGET:0:7}"
           body="Merges upstream \`${TARGET}\`. Created by the Upstream sync workflow: ${RUN_URL}"
           if [ "$(gh pr view "$SYNC_BRANCH" --json state -q .state 2>/dev/null)" = OPEN ]; then
-            gh pr edit "$SYNC_BRANCH" --title "$title" --body "$body"
+            # Rewrite title and body only when the upstream commit changed,
+            # so edits people make to the PR survive the runs in between.
+            if [ "$(gh pr view "$SYNC_BRANCH" --json title -q .title)" != "$title" ]; then
+              gh pr edit "$SYNC_BRANCH" --title "$title" --body "$body"
+            fi
           else
             gh pr create --base main --head "$SYNC_BRANCH" --title "$title" --body "$body"
           fi
@@ -232,16 +240,31 @@ jobs:
             gh pr merge "$SYNC_BRANCH" --disable-auto 2>/dev/null || true
             exit 0
           fi
-          if gh pr merge "$SYNC_BRANCH" --auto --merge --match-head-commit "$HEAD_SHA"; then
-            echo "state=auto" >> "$GITHUB_OUTPUT"
-          elif [ "$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" -q .object.sha)" = "$BASE" ]; then
-            # No auto-merge available (no required checks on main). main has
-            # not moved since the check, so merging now lands exactly the
-            # tree that was checked.
-            gh pr merge "$SYNC_BRANCH" --merge --match-head-commit "$HEAD_SHA" && echo "state=merged" >> "$GITHUB_OUTPUT" ||
-              echo "state=refused" >> "$GITHUB_OUTPUT"
-          else
+          # Merge only onto the main that was checked. `gh pr merge --auto`
+          # merges at once when the PR is already mergeable, so this must be
+          # decided before any merge call. If main moved, the next run merges
+          # it into the branch and checks again.
+          if [ "$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" -q .object.sha)" != "$BASE" ]; then
+            gh pr merge "$SYNC_BRANCH" --disable-auto 2>/dev/null || true
             echo "state=main-moved" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Auto-merge already on for this exact head: leave it, so its timer
+          # (reported after 12 hours) keeps running.
+          if [ "$(gh pr view "$SYNC_BRANCH" --json autoMergeRequest,headRefOid \
+                  -q '(.autoMergeRequest != null) and (.headRefOid == "'"$HEAD_SHA"'")')" = true ]; then
+            echo "state=auto" >> "$GITHUB_OUTPUT"
+          elif gh pr merge "$SYNC_BRANCH" --auto --merge --match-head-commit "$HEAD_SHA"; then
+            if [ "$(gh pr view "$SYNC_BRANCH" --json state -q .state)" = MERGED ]; then
+              echo "state=merged" >> "$GITHUB_OUTPUT"
+            else
+              echo "state=auto" >> "$GITHUB_OUTPUT"
+            fi
+          elif gh pr merge "$SYNC_BRANCH" --merge --match-head-commit "$HEAD_SHA"; then
+            # Auto-merge unavailable (not allowed, or no required checks).
+            echo "state=merged" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=refused" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Report
@@ -252,33 +275,43 @@ jobs:
           PR_STATE: ${{ steps.pr.outputs.state }}
         run: |
           # One reason per run, most specific first; `code` de-duplicates.
-          if [ "$CONFLICT" = upstream ]; then
+          if [ "$UP_TO_DATE" = true ]; then
+            code=synced
+          elif [ "$CONFLICT" = upstream ]; then
             code=conflict; reason="Merging upstream conflicts in: $(echo "$CONFLICTS" | tr '\n' ' ')"
           elif [ "$CONFLICT" = main ]; then
             code=conflict-main; reason="The open upstream-sync branch conflicts with main in: $(echo "$CONFLICTS" | tr '\n' ' ')"
+          elif [ "$CONFLICT" = error ]; then
+            code=merge-error; reason="Merging failed without a conflict (for example rewritten upstream history); see the run log."
           elif [ -n "$HEAD_SHA" ] && [ "$PUSHED" != success ]; then
             code=push; reason="The checked merge could not be verified or pushed; see the run log."
           elif [ "$CHECKS_OK" != true ]; then
             code=checks; reason="The check job failed: fetching upstream, or a fork check on the merged tree (invariants, tests, guard, npx skills round trip)."
           elif [ "$TOUCHES_PROTECTED" = true ]; then
             code=protected; reason="Upstream changed .github/, installer/ or skills/fork/: review the sync PR by hand and merge it."
-          elif [ "$PR_STATE" = refused ] || [ -z "$PR_STATE" ]; then
-            code=merge; reason="Checks passed but the sync PR could not be auto-merged or merged: check that auto-merge is allowed and that main does not require an approving review."
-          elif [ "$PR_STATE" = auto ] &&
-               [ "$(gh pr view "$SYNC_BRANCH" --json createdAt -q '.createdAt | fromdateiso8601 < (now - 43200)')" = true ]; then
+          elif [ "$PR_STATE" = merged ]; then
+            code=synced
+          elif [ "$PR_STATE" = main-moved ]; then
+            echo "main moved during the run; the next run merges it and checks again." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          elif [ "$PR_STATE" = auto ]; then
+            if [ "$(gh pr view "$SYNC_BRANCH" --json autoMergeRequest \
+                    -q '.autoMergeRequest.enabledAt | fromdateiso8601 < (now - 43200)')" != true ]; then
+              exit 0 # waiting on the required check
+            fi
             code=stalled; reason="The sync PR has waited on auto-merge for over 12 hours: a required review or check is not being satisfied."
           else
-            code=ok
+            code=merge; reason="Checks passed but the sync PR could not be merged: check that auto-merge is allowed and that main does not require an approving review."
           fi
-          marker="<!-- upstream-sync:${TARGET}:${code} -->"
           existing=$(gh issue list --label upstream-sync --state open --json number -q '.[0].number')
-          if [ "$code" = ok ]; then
-            # Close a previous report once a sync goes through again.
+          if [ "$code" = synced ]; then
+            # main has upstream: close a report still open from earlier.
             if [ -n "$existing" ]; then
-              gh issue close "$existing" --comment "Upstream \`${TARGET}\` synced (${PR_STATE}). ${RUN_URL}"
+              gh issue close "$existing" --comment "main now contains upstream \`${TARGET}\`. ${RUN_URL}"
             fi
             exit 0
           fi
+          marker="<!-- upstream-sync:${TARGET}:${code} -->"
           body="Upstream \`${TARGET}\` could not be synced automatically. ${reason} Run: ${RUN_URL}
           ${marker}"
           if [ -n "$existing" ]; then
