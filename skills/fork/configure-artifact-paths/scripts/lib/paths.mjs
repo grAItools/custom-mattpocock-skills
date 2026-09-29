@@ -129,6 +129,23 @@ export function normalizePath(key, value) {
 }
 
 // Locations owned by git, package managers, the agents, or this skill.
+// Top-level folders agents keep their own files in (the `npx skills` 1.7.0
+// agent table, plus a few agents it does not list). A path may live below
+// one (`.agents/config`), but must not be one: a tracker at `.agents` with a
+// feature called `skills` would write into the installed skills.
+const AGENT_HOMES = new Set(
+  (
+    ".adal .agent .agents .aider-desk .augment .autohand .bob .claude .codeartsdoer .codebuddy .codemaker .codestudio " +
+    ".codex .commandcode .continue .cortex .crush .cursor .devin .forge .fx .gemini .github .goose .grok .hermes .iflow " +
+    ".inferencesh .jazz .junie .kimchi .kiro .kode .lingma .mcpjam .minimax .moxby .mux .neovate .omp .ona .opencode " +
+    ".openhands .pi .pochi .posit .qoder .qwen .reasonix .roo .rovodev .tabnine .terramind .tinycloud .trae .vibe " +
+    ".windsurf .zcode .zencoder"
+  ).split(" "),
+);
+
+// Files and folders /teach keeps in its workspace.
+const TEACH_ENTRIES = ["MISSION.md", "RESOURCES.md", "GLOSSARY.md", "NOTES.md", "lessons", "reference", "assets", "learning-records"];
+
 // Compared case-insensitively: macOS and Windows file systems usually are.
 function reservedReason(path) {
   const p = path.toLowerCase();
@@ -141,8 +158,12 @@ function reservedReason(path) {
     return "reserved for /configure-artifact-paths itself";
   }
   if (["agents.md", "claude.md", "skills-lock.json"].includes(p)) return "that file has another job";
+  if (AGENT_HOMES.has(p)) return `${path}/ is an agent's own folder; use a folder below it or elsewhere`;
   return null;
 }
+
+const lower = (p) => p.toLowerCase();
+const within = (child, parent) => parent === "." || lower(child) === lower(parent) || lower(child).startsWith(`${lower(parent)}/`);
 
 // Returns a fully populated, normalized config. Throws with a readable
 // message on anything it cannot accept.
@@ -164,14 +185,32 @@ export function validateConfig(raw) {
   for (const key of Object.keys(PATH_KEYS)) {
     paths[key] = normalizePath(key, key in rawPaths ? rawPaths[key] : PATH_KEYS[key].default);
   }
-  // Two artifacts sharing one location would overwrite or confuse each other.
-  const owner = new Map();
-  for (const [key, value] of Object.entries(paths)) {
-    if (value === null || value === ".") continue;
-    if (owner.has(value)) {
-      throw new Error(`paths.${owner.get(value)} and paths.${key} both point at ${JSON.stringify(value)}`);
+  // Two artifacts sharing one location, or one inside another, would
+  // overwrite or confuse each other (an ADR folder's numbering scan would
+  // read a glossary kept inside it).
+  const set = Object.entries(paths).filter(([k, v]) => v !== null && !(k === "teachDir" && v === "."));
+  for (const [i, [a, va]] of set.entries()) {
+    for (const [b, vb] of set.slice(i + 1)) {
+      if (lower(va) === lower(vb)) throw new Error(`paths.${a} and paths.${b} both point at ${JSON.stringify(va)}`);
+      if (within(va, vb)) throw new Error(`paths.${a} (${va}) is inside paths.${b} (${vb}); keep them apart`);
+      if (within(vb, va)) throw new Error(`paths.${b} (${vb}) is inside paths.${a} (${va}); keep them apart`);
     }
-    owner.set(value, key);
   }
   return { paths };
+}
+
+// When /teach is installed, no artifact may land on one of its workspace's
+// own files (e.g. `glossary: "GLOSSARY.md"` with the workspace at the root).
+export function checkTeachCollisions(paths) {
+  for (const [key, value] of Object.entries(paths)) {
+    if (key === "teachDir" || value === null) continue;
+    for (const entry of TEACH_ENTRIES) {
+      const taken = paths.teachDir === "." ? entry : `${paths.teachDir}/${entry}`;
+      if (within(value, taken)) {
+        throw new Error(
+          `paths.${key} (${value}) collides with the /teach workspace's ${entry}; pick another path or set teachDir`,
+        );
+      }
+    }
+  }
 }

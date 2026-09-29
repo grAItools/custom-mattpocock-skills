@@ -34,7 +34,7 @@ Mention any copy whose state is `modified` or `broken` now, since step 4 will st
 
 ### 3. Save
 
-Run `node <skill folder>/scripts/configure.mjs set key=value ...` with the user's changes. It validates each value (relative paths only; glossary and context map must be `.md` files; no two keys may share a path; `.git/`, `node_modules/`, agent skill folders, `AGENTS.md` and `CLAUDE.md` are refused) and saves `.agents/skill-paths.json`. On an error, show it and ask for a corrected value. Skip this step when nothing changed.
+Run `node <skill folder>/scripts/configure.mjs set key=value ...` with the user's changes. It validates each value (relative paths only; glossary and context map must be `.md` files; no path may equal or sit inside another; `.git/`, `node_modules/`, agents' own folders such as `.agents/` or `.claude/`, `AGENTS.md` and `CLAUDE.md` are refused; with /teach installed, nothing may land on its workspace files) and saves `.agents/skill-paths.json`. On an error, show it and ask for a corrected value. Skip this step when nothing changed.
 
 ### 4. Apply
 

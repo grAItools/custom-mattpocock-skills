@@ -2,11 +2,18 @@
 
 import { RULES, substitutePlaceholders } from "./rules.mjs";
 
-const TEXT_EXTENSIONS = new Set([".md", ".yaml", ".yml", ".sh", ".txt", ".json", ".html"]);
+const utf8 = new TextDecoder("utf-8", { fatal: true });
 
-export function isText(rel) {
-  const dot = rel.lastIndexOf(".");
-  return dot !== -1 && TEXT_EXTENSIONS.has(rel.slice(dot));
+// Every file that decodes as UTF-8 is text, whatever its extension, so a
+// helper script upstream adds is rendered (and guarded) like the prose.
+export function isText(content) {
+  if (content.includes(0)) return false;
+  try {
+    utf8.decode(content);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // files: [{ rel, content: Buffer }]. Returns { files, counts } where files
@@ -15,18 +22,26 @@ export function isText(rel) {
 export function renderFiles(name, files, paths) {
   const counts = {};
   const out = files.map((file) => {
-    if (!isText(file.rel)) return file;
+    if (!isText(file.content)) return file;
     let text = file.content.toString("utf8");
-    for (const rule of RULES) {
-      if (rule.skills && !rule.skills.includes(name)) continue;
-      if (rule.files && !rule.files.includes(file.rel)) continue;
-      if (rule.when && !rule.when(paths)) continue;
-      const result = rule.apply(text);
-      text = result.text;
-      counts[file.rel] ??= {};
-      counts[file.rel][rule.id] = (counts[file.rel][rule.id] ?? 0) + result.count;
-    }
-    return { ...file, content: Buffer.from(substitutePlaceholders(text, paths), "utf8") };
+    // Rules marked `post` run after the values are in, e.g. to realign
+    // text whose width changed.
+    const run = (post) => {
+      for (const rule of RULES) {
+        if (Boolean(rule.post) !== post) continue;
+        if (rule.skills && !rule.skills.includes(name)) continue;
+        if (rule.files && !rule.files.includes(file.rel)) continue;
+        if (rule.when && !rule.when(paths)) continue;
+        const result = rule.apply(text);
+        text = result.text;
+        counts[file.rel] ??= {};
+        counts[file.rel][rule.id] = (counts[file.rel][rule.id] ?? 0) + result.count;
+      }
+    };
+    run(false);
+    text = substitutePlaceholders(text, paths);
+    run(true);
+    return { ...file, content: Buffer.from(text, "utf8") };
   });
   return { files: out, counts };
 }

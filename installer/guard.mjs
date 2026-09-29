@@ -99,7 +99,7 @@ export function runGuard(skills = listSkills()) {
     const { files, counts } = renderFiles(name, readSkill(dir), SENTINEL_PATHS);
     countsBySkill.set(name, counts);
     for (const { rel, content } of files) {
-      if (!isText(rel)) continue;
+      if (!isText(content)) continue;
       content
         .toString("utf8")
         .split("\n")

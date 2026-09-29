@@ -25,7 +25,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { CONFIG_FILE, LOCK_FILE, ORIGINALS_DIR, PATH_KEYS, defaultPaths, normalizePath, validateConfig } from "./paths.mjs";
+import { CONFIG_FILE, LOCK_FILE, ORIGINALS_DIR, PATH_KEYS, checkTeachCollisions, defaultPaths, normalizePath, validateConfig } from "./paths.mjs";
 import { renderFiles } from "./render.mjs";
 
 export const SELF = "configure-artifact-paths";
@@ -139,18 +139,34 @@ export function setPaths(root, assignments) {
     paths[key] = value === "default" ? PATH_KEYS[key].default : normalizePath(key, value === "null" ? null : value);
   }
   const next = validateConfig({ paths });
+  if (teachInstalled(root)) checkTeachCollisions(next.paths);
   writeConfig(root, next);
   return next;
 }
 
+// A lock written before a path key existed has no value for it: the skills
+// then used that key's default. Keys that no longer exist are dropped.
 export function loadLock(root) {
   const file = join(root, LOCK_FILE);
   if (!existsSync(file)) return null;
   const lock = readJson(file);
-  return lock.copies ? lock : null;
+  if (!lock.copies) return null;
+  const applied = lock.config?.paths ?? {};
+  const paths = Object.fromEntries(
+    Object.keys(PATH_KEYS).map((k) => [k, k in applied ? applied[k] : PATH_KEYS[k].default]),
+  );
+  return { ...lock, config: { paths } };
 }
 
 // ---------------------------------------------------------------- discovery
+
+function teachInstalled(root) {
+  try {
+    return managedSkills(root).some((s) => s.name === "teach");
+  } catch {
+    return false;
+  }
+}
 
 // The skills installed from the same source as this skill, per skills-lock.json.
 export function managedSkills(root) {
@@ -260,11 +276,13 @@ function inspectAll(root, skills, lock) {
 // ---------------------------------------------------------------- AGENTS.md
 
 export function managedBlock(paths) {
+  // Unset optional keys keep the skill's own convention, and so does /teach
+  // with its default workspace ("the current directory", not the repo root).
   const rows = Object.entries(PATH_KEYS)
-    .filter(([key]) => paths[key] !== null)
+    .filter(([key]) => paths[key] !== null && !(key === "teachDir" && paths[key] === "."))
     .map(([key, spec]) => {
       const where = spec.scope === "context" ? " (per context)" : "";
-      const value = paths[key] === "." ? "the repo root" : `\`${paths[key]}${spec.kind === "dir" ? "/" : ""}\``;
+      const value = `\`${paths[key]}${spec.kind === "dir" ? "/" : ""}\``;
       return `| ${spec.label}${where} | ${value} |`;
     });
   return [
@@ -344,11 +362,13 @@ export function instructionFiles(root, paths) {
 // only ever rewritten inside these, never in prose.
 const PATH_SPANS = /`([^`\n]+)`|\]\(([^)\s]+)\)/g;
 
-function mapSpans(text, fn) {
+function mapSpans(text, onCode, onLink = onCode) {
   return text.replace(PATH_SPANS, (m, code, link) =>
-    code !== undefined ? `\`${fn(code)}\`` : `](${fn(link)})`,
+    code !== undefined ? `\`${onCode(code)}\`` : `](${onLink(link)})`,
   );
 }
+
+const isExternal = (target) => /^([a-z][a-z0-9+.-]*:|\/|#)/i.test(target);
 
 // Context roots: the repo root plus the folders the context map points
 // into. Upstream defines a multi-context project by the presence of that
@@ -371,19 +391,6 @@ function contextRoots(root, oldPaths, mapFile = join(root, oldPaths.contextMap))
     return span;
   });
   return [...roots];
-}
-
-// Re-bases the relative link targets of a Markdown file moving from folder
-// `fromDir` to folder `toDir`, so they keep pointing at the same files.
-function rebaseLinks(text, fromDir, toDir) {
-  if (fromDir === toDir) return text;
-  return text.replace(/\]\(([^)\s]+)\)/g, (m, target) => {
-    if (/^([a-z][a-z0-9+.-]*:|\/|#)/i.test(target)) return m;
-    const [path, hash = ""] = target.split(/(?=#)/);
-    let next = relative(toDir, resolve(fromDir, path)).split(sep).join("/") || ".";
-    if (!next.startsWith("../") && next !== ".") next = `./${next}`;
-    return `](${next}${path.endsWith("/") ? "/" : ""}${hash})`;
-  });
 }
 
 // Moves needed to bring existing artifacts from `oldPaths` to `newPaths`.
@@ -471,10 +478,31 @@ function changedLines(before, after) {
   return out;
 }
 
+// Rewrites one relative link target of a file that moves from folder
+// `oldDir` to `newDir` (often the same folder). The target is resolved
+// against the old folder, rewritten as a repo-relative path, and made
+// relative to the new folder, so it keeps pointing at the artifact wherever
+// both ended up.
+function rewriteLink(root, target, oldDir, newDir, rewrite) {
+  if (isExternal(target)) return target;
+  const [path, hash = ""] = target.split(/(?=#)/);
+  const slash = path.endsWith("/") ? "/" : "";
+  const abs = resolve(oldDir, path);
+  const inRepo = abs === root || isInside(abs, root);
+  const repoRel = inRepo ? `${rel(root, abs)}${slash}` : null;
+  const rewritten = repoRel === null ? null : rewrite(repoRel);
+  if (oldDir === newDir && rewritten === repoRel) return target;
+  const newAbs = rewritten === null ? abs : resolve(root, rewritten);
+  let next = relative(newDir, newAbs).split(sep).join("/") || ".";
+  if (!next.startsWith("../") && next !== ".") next = `./${next}`;
+  return `${next}${(rewritten ?? path).endsWith("/") && next !== "." ? "/" : ""}${hash}`;
+}
+
 // References to moved paths in the files known to hold them: the
 // instruction files, the context map (at its old or new location), and the
-// config written by /setup-matt-pocock-skills. Each rewrite carries the
-// changed lines so the user sees exactly what will change.
+// config written by /setup-matt-pocock-skills. Code spans are read as
+// repo-relative paths; link targets as relative to their file. Each rewrite
+// carries the changed lines so the user sees exactly what will change.
 export function planReferenceRewrites(root, oldPaths, newPaths) {
   // The map may already have moved (re-planning after --migrate): read both.
   const contexts = new Set([
@@ -483,16 +511,23 @@ export function planReferenceRewrites(root, oldPaths, newPaths) {
   ]);
   const contextPrefixes = [...contexts].filter((c) => c !== root).map((c) => rel(root, c));
   const rewrite = referenceRewriter(oldPaths, newPaths, contextPrefixes) ?? ((span) => span);
-  const oldMapDir = dirname(join(root, oldPaths.contextMap));
-  const newMapDir = dirname(join(root, newPaths.contextMap));
+  const oldConfigDir = join(root, oldPaths.skillsConfigDir);
+  const newConfigDir = join(root, newPaths.skillsConfigDir);
   const mapFiles = new Set([join(root, oldPaths.contextMap), join(root, newPaths.contextMap)].map(realpathOrNull));
+  // The folder a file was written in, and the one it ends up in.
+  const foldersOf = (real) => {
+    if (mapFiles.has(real)) return [dirname(join(root, oldPaths.contextMap)), dirname(join(root, newPaths.contextMap))];
+    const configDirs = [oldConfigDir, newConfigDir].map((d) => realpathOrNull(d) ?? d);
+    if (configDirs.some((d) => isInside(real, d))) return [oldConfigDir, newConfigDir];
+    return [root, root];
+  };
   const candidates = [
     join(root, "AGENTS.md"),
     join(root, "CLAUDE.md"),
     join(root, oldPaths.contextMap),
     join(root, newPaths.contextMap),
   ];
-  for (const dir of [join(root, oldPaths.skillsConfigDir), join(root, newPaths.skillsConfigDir)]) {
+  for (const dir of [oldConfigDir, newConfigDir]) {
     if (isKind(dir, "dir")) {
       for (const f of readdirSync(dir)) if (f.endsWith(".md")) candidates.push(join(dir, f));
     }
@@ -503,6 +538,7 @@ export function planReferenceRewrites(root, oldPaths, newPaths) {
     const real = realpathOrNull(file);
     if (!real || seen.has(real) || !isKind(real, "file")) continue;
     seen.add(real);
+    const [oldDir, newDir] = foldersOf(real);
     const before = readFileSync(real, "utf8");
     // The generated block is rebuilt from the config anyway: leave it out.
     const start = before.indexOf(BLOCK_START);
@@ -511,9 +547,8 @@ export function planReferenceRewrites(root, oldPaths, newPaths) {
       start !== -1 && end > start
         ? [before.slice(0, start), before.slice(start, end), before.slice(end)]
         : [before, "", ""];
-    // The context map's links were written for its old folder.
-    const rebase = (t) => (mapFiles.has(real) ? rebaseLinks(t, oldMapDir, newMapDir) : t);
-    const after = mapSpans(rebase(head), rewrite) + block + mapSpans(rebase(tail), rewrite);
+    const onLink = (target) => rewriteLink(root, target, oldDir, newDir, rewrite);
+    const after = mapSpans(head, rewrite, onLink) + block + mapSpans(tail, rewrite, onLink);
     if (after !== before) rewrites.push({ file, after, lines: changedLines(before, after) });
   }
   return rewrites;
@@ -573,6 +608,7 @@ export function apply(root, opts = {}) {
   const { exists: configExists, config } = loadConfig(root);
   const lock = loadLock(root);
   const skills = managedSkills(root);
+  if (skills.some((s) => s.name === "teach")) checkTeachCollisions(config.paths);
   const { copies, missing } = inspectAll(root, skills, lock);
   for (const name of missing) log(`skip ${name}: listed in ${SKILLS_LOCK} but not installed`);
 
@@ -625,7 +661,7 @@ export function apply(root, opts = {}) {
       } catch (err) {
         const moved = done.map((m) => `${rel(root, m.src)} -> ${rel(root, m.dest)}`);
         throw new Error(
-          `migration stopped: ${err.message}\nalready moved:\n  ${moved.join("\n  ") || "(nothing)"}\nmove those back, or finish by hand and re-run with --skip-migration`,
+          `migration stopped: ${err.message}\nalready moved:\n  ${moved.join("\n  ") || "(nothing)"}\nfix the cause and re-run with --migrate: moves already done are skipped, and the reference updates still run`,
         );
       }
       const final = dryRun ? rewrites : planReferenceRewrites(root, oldPaths, config.paths);

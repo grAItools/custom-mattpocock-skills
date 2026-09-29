@@ -84,6 +84,27 @@ export const RULES = [
         `${head}docs/adr/${rest}\n${children.replace(/^│       /gm, "│   ")}`,
     ),
   },
+  // After substitution: the `← comment` arrows in directory trees line up
+  // again once paths changed width.
+  {
+    id: "tree-arrows",
+    skills: ["domain-modeling"],
+    files: ["SKILL.md"],
+    post: true,
+    when: (paths) => ["glossary", "contextMap", "adrDir"].some((k) => isChanged(k)(paths)),
+    apply: regex(/^```\n[\s\S]*?^```$/gm, (block) => {
+      const lines = block.split("\n");
+      const lefts = lines.filter((l) => l.includes(" ← ")).map((l) => l.slice(0, l.indexOf(" ← ")).trimEnd());
+      if (!lefts.length) return block;
+      const width = Math.max(...lefts.map((l) => l.length)) + 2;
+      return lines
+        .map((l) => {
+          const at = l.indexOf(" ← ");
+          return at === -1 ? l : `${l.slice(0, at).trimEnd().padEnd(width)}${l.slice(at + 1)}`;
+        })
+        .join("\n");
+    }),
+  },
   {
     id: "tokens",
     apply: regex(TOKEN_RE, (_m, token) => ph(TOKEN_KEY[token])),
@@ -174,7 +195,7 @@ export const RULES = [
     files: ["SKILL.md"],
     apply: literal(
       "**Pick the file to edit:**\n\n- If `CLAUDE.md` exists, edit it.\n- Else if `AGENTS.md` exists, edit it.\n- If neither exists, ask the user which one to create; don't pick for them.\n\nNever create `AGENTS.md` when `CLAUDE.md` already exists (or vice versa); always edit the one that's already there.",
-      "**Pick the file to edit:** always `AGENTS.md`. Codex, OpenCode and oh-my-pi read it directly, and Claude Code reads it through the `@AGENTS.md` line in `CLAUDE.md`. `/configure-artifact-paths` created both files; if `CLAUDE.md` has lost that line, add it back, unless `CLAUDE.md` is a symlink to `AGENTS.md` (then it is the same file and needs no import). Keep the `## Agent skills` block out of the generated `Artifact locations` block (between the `mattpocock-skills:paths` markers).",
+      "**Pick the file to edit:** always `AGENTS.md`. Codex, OpenCode and oh-my-pi read it directly, and Claude Code reads it through the `@AGENTS.md` line in `CLAUDE.md`. `/configure-artifact-paths` created both files; if `CLAUDE.md` has lost that line, add it back, unless `CLAUDE.md` is a symlink to `AGENTS.md` (then it is the same file and needs no import). If `CLAUDE.md` already holds an `## Agent skills` block from an earlier setup, move it into `AGENTS.md` and delete it from `CLAUDE.md`, so there is exactly one. Keep the `## Agent skills` block out of the generated `Artifact locations` block (between the `mattpocock-skills:paths` markers).",
     ),
   },
   {
