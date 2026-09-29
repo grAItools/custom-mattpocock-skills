@@ -1,12 +1,15 @@
 # Configurable artifact paths
 
-Fork-only. Lets each project choose where the skills keep its files (glossary, ADRs, local issues, and more) while installing with the standard `npx skills` CLI. Nothing here edits upstream files, which keeps merges from upstream conflict-free.
+Fork-only. Lets each project choose where the skills keep its files (glossary, ADRs, local issues, and more) while installing with the standard `npx skills` CLI, and keeps the fork in step with upstream. The fork adds files and edits a single upstream line, which keeps merges from upstream conflict-free in practice.
 
 The fork-only files are:
 
 - [`skills/fork/configure-artifact-paths/`](../skills/fork/configure-artifact-paths/SKILL.md): the user-invoked skill, with the renderer in `scripts/`.
 - `installer/`: this README, the upstream-sync guard and the tests.
 - `.github/workflows/installer.yml`: runs the tests and the guard.
+- `.github/workflows/upstream-sync.yml`: merges upstream into `main` every 6 hours when everything passes (see [Upstream sync](#upstream-sync)).
+
+The one upstream file the fork edits is `.github/workflows/release.yml`: its changesets job runs only in `mattpocock/skills` (`if: github.repository == 'mattpocock/skills'`), so the fork never opens version PRs.
 
 ## Using it in a project
 
@@ -69,7 +72,36 @@ Only skills that `skills-lock.json` lists with the same source as `configure-art
 
 When paths change and artifacts already exist at the previous ones, `apply` stops and lists them. On the first apply the previous paths are the upstream defaults, so a project already using the skills gets the same prompt. `--migrate` moves them (with `git mv` when tracked, including per-context copies) and rewrites references in `AGENTS.md`, `CLAUDE.md`, the context map and the files in `skillsConfigDir`; `--skip-migration` leaves them. References are only rewritten where they look like paths: inside code spans and link targets, at the start of the path (or after a `/` for the per-context glossary and ADR folder), and in one pass so a new path is never rewritten again. Prose is never touched, and the stop message shows every line that would change. Code spans are read as repo-relative paths. Claude Code `@path` imports in `AGENTS.md` and `CLAUDE.md` are updated too. Link targets are read relative to their file: each is resolved against the folder the file was written in, rewritten, then made relative to the folder the file ends up in, so links in a context map that moves (or sits in a subfolder) keep pointing at the artifacts wherever they moved. If a move fails midway, fix the cause and re-run `--migrate`: moves already done are skipped and the reference updates still run. Per-context artifacts are looked for at the repo root and in each context the context map links to (by its glossary or ADR folder); without a context map the project is single-context. Ignored, vendored and dependency folders are never scanned. Every move is checked before any runs: a destination that already exists, a folder moved into itself, or two overlapping moves blocks `--migrate`. A changed `teachDir` is listed but always moved by hand.
 
-## Keeping the fork in sync with upstream
+## Upstream sync
+
+`.github/workflows/upstream-sync.yml` runs every 6 hours (and on demand from the Actions tab) and keeps `main` within a day of upstream `main`, which is what `npx skills add mattpocock/skills` installs. It has two jobs:
+
+- **check** has no write token. It merges upstream `main` into an `upstream-sync` branch cut from `main` (a merge commit, never a rebase; a branch left open by an earlier blocked run is built on, so fixes pushed to it survive), records the merge commit, and only then runs the checks on the merged tree: the `release.yml` guard line, the tests, the guard and the real `npx skills` round trips.
+- **publish** holds the GitHub App token and never executes anything from the tree. It trusts nothing `check` produced after running upstream code and re-derives it from git objects: the checked `main` must be on this repository's `main` and the upstream commit on upstream's `main` (fetched again here), the commit must be the one `check` recorded before the checks, must contain both, and every new commit must be either upstream's own or a clean merge whose tree git reproduces. Which paths the sync changes is computed from exactly what would land (the head against the checked `main`), so no shape of upstream history can hide a change. It then pushes the branch, opens or updates one PR and enables auto-merge, but only when every check passed and the sync does not change `.github/`, `installer/` or `skills/fork/`; a fix you push to the sync branch that touches those paths counts too, so such a PR waits for you to merge it. Any auto-merge left on from an earlier run is switched off before the head changes, and switched on again only for an eligible head.
+
+**Workflow changes are never pushed.** A branch pushed to this repository runs the workflow files it contains, with this repository's secrets, so when the sync would change anything under `.github/` the workflow does not push at all: it reports the change with a compare link for you to review and merge by hand. As a backstop the App has no Workflows permission, so GitHub itself refuses any App push of commits that change workflow files. Upstream's other code does run here, in the `check` job and in `installer.yml` on the sync branch, but both have read-only tokens and no secrets, and the App's private key is only readable by jobs running on `main` (setup step 2). The `check` job runs on `main` with sudo on its runner, so never add caching to workflows here without considering that upstream code could write a cache that a job on `main` later restores. The actions in the sync workflow are pinned to commit SHAs.
+
+It merges only onto the `main` the checks ran against: if `main` moved during the run, it switches off auto-merge and the next run merges `main` into the branch and checks again.
+
+Everything else is reported on a single issue labelled `upstream-sync`, one comment per upstream commit and reason: a merge conflict (with upstream, or between `main` and the open sync branch), a merge that failed for another reason (such as rewritten upstream history), a failing check, an upstream change under `.github/` (not pushed), a change to `installer/` or `skills/fork/` (pushed, not auto-merged; also when the change comes from a fix pushed to the sync branch), a PR that could not be merged, or a sync PR over 24 hours old whose auto-merge was already waiting before the run (so a PR that just turned green is not reported). A run that needs attention also ends red, so GitHub notifies you. The issue is closed as soon as `main` contains upstream (confirmed by the publish job from git objects, not taken from the check job), whether the sync merged itself or you finished it by hand; a sync PR left behind is then closed too, when `main` already contains its branch or has the same tree.
+
+### One-time setup
+
+Until `SYNC_APP_ID` exists both jobs are skipped, so the workflow is harmless before this. In a GitHub fork, Actions start disabled: enable them first on the Actions tab, or the schedule never runs.
+
+1. **Create a GitHub App** (Settings, Developer settings, GitHub Apps, New). No webhook. Repository permissions: *Contents*, *Pull requests* and *Issues*, all read and write. Leave *Workflows* at no access: the sync never pushes workflow changes, and without that permission GitHub refuses them anyway. Install it on this repository only.
+2. **Store its credentials.** Create an environment named `upstream-sync` (Settings, Environments) with *Deployment branches and tags* limited to `main` and no required reviewers, and add a generated private key to it as the environment secret `SYNC_APP_PRIVATE_KEY`; only jobs running on `main` can then read it. Add the App ID as the repository variable `SYNC_APP_ID` (Settings, Secrets and variables, Actions). Where environments with branch policies are not available (a private repository on a free plan), a repository secret works too; the key is then protected only by upstream workflow changes never being pushed.
+3. **Make workflow tokens read-only by default** (Settings, Actions, General, Workflow permissions: "Read repository contents and packages permissions"). The fork's workflows declare what they need; this covers any that do not.
+4. **Allow auto-merge**: Settings, General, Pull Requests, "Allow auto-merge".
+5. **Protect `main`** with a ruleset or branch protection that requires the status check "Tests and upstream-sync guard" **and requires branches to be up to date before merging** (strict). Auto-merge then waits for the check, and cannot merge the PR onto a newer `main` it was not checked against; the next run brings the branch up to date and checks again. Do **not** require an approving review: the App cannot approve, so auto-merge would wait forever (the workflow reports a sync PR still open after 24 hours). Without protection the workflow merges at once, but only onto the `main` it checked; a commit landing on `main` in the seconds between that comparison and the merge is the one gap protection closes.
+6. **Let head branches be deleted after merging** (Settings, General, Pull Requests, "Automatically delete head branches"), and merge sync PRs you merge by hand with a merge commit. A squash or rebase merge leaves the old `upstream-sync` branch looking unmerged, and the next run would build on it.
+7. **Run it once by hand** (Actions, Upstream sync, Run workflow) and check the run: with nothing new upstream it reports "Up to date".
+
+Each run of the publish job shows up as a deployment to the `upstream-sync` environment. GitHub may delay scheduled runs, and in a public repository disables scheduled workflows after 60 days without activity (it emails you; re-enable it from the Actions tab). If the App token cannot be created (wrong ID or key), the run fails before it can open an issue: the red run is the only signal.
+
+To drop a sync PR, close it **and delete the `upstream-sync` branch**; otherwise the next run builds on the branch and reopens it. The workflow sets the PR's title and body only when the upstream commit changes, so edits you make to them stay until then. The workflow always proposes the latest upstream `main`: to hold upstream back for a while, disable the workflow from the Actions tab.
+
+### By hand
 
 ```sh
 git remote add upstream https://github.com/mattpocock/skills   # once
