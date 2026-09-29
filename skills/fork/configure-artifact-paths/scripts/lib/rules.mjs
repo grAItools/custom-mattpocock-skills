@@ -174,7 +174,7 @@ export const RULES = [
     files: ["SKILL.md"],
     apply: literal(
       "**Pick the file to edit:**\n\n- If `CLAUDE.md` exists, edit it.\n- Else if `AGENTS.md` exists, edit it.\n- If neither exists, ask the user which one to create; don't pick for them.\n\nNever create `AGENTS.md` when `CLAUDE.md` already exists (or vice versa); always edit the one that's already there.",
-      "**Pick the file to edit:** always `AGENTS.md`. Codex, OpenCode and oh-my-pi read it directly, and Claude Code reads it through the `@AGENTS.md` line in `CLAUDE.md`. `/configure-artifact-paths` created both files; if `CLAUDE.md` has lost that line, add it back. Keep the `## Agent skills` block out of the generated `Artifact locations` block (between the `mattpocock-skills:paths` markers).",
+      "**Pick the file to edit:** always `AGENTS.md`. Codex, OpenCode and oh-my-pi read it directly, and Claude Code reads it through the `@AGENTS.md` line in `CLAUDE.md`. `/configure-artifact-paths` created both files; if `CLAUDE.md` has lost that line, add it back, unless `CLAUDE.md` is a symlink to `AGENTS.md` (then it is the same file and needs no import). Keep the `## Agent skills` block out of the generated `Artifact locations` block (between the `mattpocock-skills:paths` markers).",
     ),
   },
   {

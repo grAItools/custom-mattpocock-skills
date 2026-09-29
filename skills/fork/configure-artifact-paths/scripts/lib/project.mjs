@@ -18,12 +18,13 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { CONFIG_FILE, LOCK_FILE, ORIGINALS_DIR, PATH_KEYS, defaultPaths, normalizePath, validateConfig } from "./paths.mjs";
 import { renderFiles } from "./render.mjs";
 
@@ -134,6 +135,7 @@ export function setPaths(root, assignments) {
     const key = a.slice(0, eq).trim();
     const value = a.slice(eq + 1).trim();
     if (!(key in PATH_KEYS)) normalizePath(key, value);
+    // `default` and `null` are keywords; `./default` names a folder.
     paths[key] = value === "default" ? PATH_KEYS[key].default : normalizePath(key, value === "null" ? null : value);
   }
   const next = validateConfig({ paths });
@@ -164,7 +166,7 @@ export function managedSkills(root) {
   const source = (self.sourceUrl ?? self.source ?? "").toLowerCase();
   return Object.entries(lock.skills)
     .filter(([name, e]) => name !== SELF && (e.sourceUrl ?? e.source ?? "").toLowerCase() === source)
-    .map(([name, e]) => ({ name, computedHash: e.computedHash ?? null }))
+    .map(([name, e]) => ({ name, source: e.source ?? null, computedHash: e.computedHash ?? null }))
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -176,11 +178,18 @@ function candidateCopies(root, name) {
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     if (entry.isDirectory() && entry.name.startsWith(".") && entry.name !== ".git") bases.add(`${entry.name}/skills`);
   }
+  // A skills folder that is itself a symlink (`.claude/skills` ->
+  // `.agents/skills`) reaches the same copy twice: keep the first.
   const found = [];
+  const seen = new Set();
   for (const [list, plain] of [[bases, false], [PLAIN_SKILL_BASES, true]]) {
     for (const base of list) {
       const dir = join(root, ...base.split("/"), name);
-      if (isKind(dir, "dir") && existsSync(join(dir, "SKILL.md"))) found.push({ dir, plain });
+      if (!isKind(dir, "dir") || !existsSync(join(dir, "SKILL.md"))) continue;
+      const real = realpathSync(dir);
+      if (seen.has(real)) continue;
+      seen.add(real);
+      found.push({ dir, plain });
     }
   }
   return found;
@@ -293,19 +302,31 @@ function realpathOrNull(path) {
   }
 }
 
+// The file a path names, following a symlink even when its target is
+// missing (a dangling `CLAUDE.md -> AGENTS.md` still names AGENTS.md).
+function targetOf(path) {
+  const real = realpathOrNull(path);
+  if (real) return real;
+  try {
+    if (lstatSync(path).isSymbolicLink()) return resolve(dirname(path), readlinkSync(path));
+  } catch {}
+  return resolve(path);
+}
+
 // AGENTS.md gets the generated block; CLAUDE.md gets an `@AGENTS.md` import
 // so Claude Code reads it too. When one is a symlink to the other there is a
 // single file: it gets the block and no (self-)import.
 export function instructionFiles(root, paths) {
   const agentsPath = join(root, "AGENTS.md");
   const claudePath = join(root, "CLAUDE.md");
-  const agentsReal = realpathOrNull(agentsPath);
-  if (agentsReal && agentsReal === realpathOrNull(claudePath)) {
-    const text = readFileSync(agentsPath, "utf8");
-    return [{ path: agentsPath, before: text, after: upsertBlock(text, managedBlock(paths)) }];
+  const agentsTarget = targetOf(agentsPath);
+  const read = (p) => (existsSync(p) ? readFileSync(p, "utf8") : "");
+  if (agentsTarget === targetOf(claudePath)) {
+    const text = read(agentsTarget);
+    return [{ path: agentsTarget, before: text, after: upsertBlock(text, managedBlock(paths)) }];
   }
-  const agents = existsSync(agentsPath) ? readFileSync(agentsPath, "utf8") : "";
-  const claude = existsSync(claudePath) ? readFileSync(claudePath, "utf8") : "";
+  const agents = read(agentsPath);
+  const claude = read(claudePath);
   const nextClaude = hasImport(claude)
     ? claude
     : claude.trim()
@@ -319,15 +340,50 @@ export function instructionFiles(root, paths) {
 
 // ---------------------------------------------------------------- migration
 
-// Context roots: every folder except hidden ones and dependencies.
-function walkDirs(dir, out) {
-  out.push(dir);
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (entry.isDirectory() && !entry.name.startsWith(".") && entry.name !== "node_modules" && entry.name !== "vendor") {
-      walkDirs(join(dir, entry.name), out);
+// Path-shaped text in Markdown: code spans and link targets. References are
+// only ever rewritten inside these, never in prose.
+const PATH_SPANS = /`([^`\n]+)`|\]\(([^)\s]+)\)/g;
+
+function mapSpans(text, fn) {
+  return text.replace(PATH_SPANS, (m, code, link) =>
+    code !== undefined ? `\`${fn(code)}\`` : `](${fn(link)})`,
+  );
+}
+
+// Context roots: the repo root plus the folders the context map points
+// into. Upstream defines a multi-context project by the presence of that
+// map, so without one the repo root is the only context. `mapFile` is where
+// the map is now; its links are relative to `oldPaths.contextMap`, where it
+// was written (they only move with it once re-based).
+function contextRoots(root, oldPaths, mapFile = join(root, oldPaths.contextMap)) {
+  const roots = new Set([root]);
+  if (!isKind(mapFile, "file")) return [...roots];
+  const base = dirname(join(root, oldPaths.contextMap));
+  const suffixes = [oldPaths.glossary, oldPaths.adrDir];
+  mapSpans(readFileSync(mapFile, "utf8"), (span) => {
+    const target = span.replace(/#.*$/, "").replace(/\/+$/, "");
+    for (const suffix of suffixes) {
+      if (target === suffix || target.endsWith(`/${suffix}`)) {
+        const ctx = resolve(base, target.slice(0, target.length - suffix.length) || ".");
+        if (ctx === root || isInside(ctx, root)) roots.add(ctx);
+      }
     }
-  }
-  return out;
+    return span;
+  });
+  return [...roots];
+}
+
+// Re-bases the relative link targets of a Markdown file moving from folder
+// `fromDir` to folder `toDir`, so they keep pointing at the same files.
+function rebaseLinks(text, fromDir, toDir) {
+  if (fromDir === toDir) return text;
+  return text.replace(/\]\(([^)\s]+)\)/g, (m, target) => {
+    if (/^([a-z][a-z0-9+.-]*:|\/|#)/i.test(target)) return m;
+    const [path, hash = ""] = target.split(/(?=#)/);
+    let next = relative(toDir, resolve(fromDir, path)).split(sep).join("/") || ".";
+    if (!next.startsWith("../") && next !== ".") next = `./${next}`;
+    return `](${next}${path.endsWith("/") ? "/" : ""}${hash})`;
+  });
 }
 
 // Moves needed to bring existing artifacts from `oldPaths` to `newPaths`.
@@ -336,7 +392,7 @@ export function planMigration(root, oldPaths, newPaths) {
   const moves = [];
   const problems = [];
   const manual = [];
-  const contextRoots = walkDirs(root, []);
+  const contexts = contextRoots(root, oldPaths);
   for (const [key, spec] of Object.entries(PATH_KEYS)) {
     const from = oldPaths[key];
     const to = newPaths[key];
@@ -347,7 +403,7 @@ export function planMigration(root, oldPaths, newPaths) {
       }
       continue;
     }
-    for (const base of spec.scope === "context" ? contextRoots : [root]) {
+    for (const base of spec.scope === "context" ? contexts : [root]) {
       const src = join(base, from);
       if (!isKind(src, spec.kind)) continue;
       const dest = join(base, to);
@@ -377,26 +433,59 @@ export function planMigration(root, oldPaths, newPaths) {
   return { moves, problems, manual };
 }
 
-// Replaces every old path with its new one in a single pass, so a new value
-// is never rewritten again by a later key.
-function referenceRewriter(oldPaths, newPaths) {
-  const map = new Map();
-  for (const k of Object.keys(PATH_KEYS)) {
-    if (k === "teachDir" || oldPaths[k] === newPaths[k] || oldPaths[k] === null || newPaths[k] === null) continue;
-    map.set(oldPaths[k], newPaths[k]);
+// Rewrites old paths to new ones inside one path-shaped span, in a single
+// pass so a new value is never rewritten again by a later key. A path must
+// start the span (optionally after `./`), or, for the per-context glossary
+// and ADR folder, follow one of the known context folders
+// (`src/ordering/CONTEXT.md`, also behind `../`). It must end the span or be
+// followed by `/` or `#`, so `issues` never matches inside `issues-log`.
+function referenceRewriter(oldPaths, newPaths, contextPrefixes) {
+  const keys = Object.keys(PATH_KEYS)
+    .filter((k) => k !== "teachDir" && oldPaths[k] !== newPaths[k] && oldPaths[k] !== null && newPaths[k] !== null)
+    .sort((a, b) => oldPaths[b].length - oldPaths[a].length);
+  if (!keys.length) return null;
+  const alternation = keys
+    .map((k) => {
+      const before =
+        PATH_KEYS[k].scope === "context" && contextPrefixes.length
+          ? `(?<=^|^\\.\\/|^(?:\\.\\/|(?:\\.\\.\\/)*)(?:${contextPrefixes.map(escapeRe).join("|")})\\/)`
+          : "(?<=^|^\\.\\/)";
+      return `${before}(${escapeRe(oldPaths[k])})(?=$|[/#])`;
+    })
+    .join("|");
+  const re = new RegExp(alternation, "g");
+  return (span) =>
+    span.replace(re, (...args) => {
+      const i = args.slice(1, keys.length + 1).findIndex((g) => g !== undefined);
+      return newPaths[keys[i]];
+    });
+}
+
+function changedLines(before, after) {
+  const a = before.split("\n");
+  const b = after.split("\n");
+  const out = [];
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if (a[i] !== b[i]) out.push(`- ${a[i] ?? ""}`, `+ ${b[i] ?? ""}`);
   }
-  if (!map.size) return null;
-  const alternation = [...map.keys()].sort((a, b) => b.length - a.length).map(escapeRe).join("|");
-  const re = new RegExp(`(?<![\\w.-])(${alternation})(?![\\w-])`, "g");
-  return (text) => text.replace(re, (m) => map.get(m));
+  return out;
 }
 
 // References to moved paths in the files known to hold them: the
 // instruction files, the context map (at its old or new location), and the
-// config written by /setup-matt-pocock-skills.
+// config written by /setup-matt-pocock-skills. Each rewrite carries the
+// changed lines so the user sees exactly what will change.
 export function planReferenceRewrites(root, oldPaths, newPaths) {
-  const rewrite = referenceRewriter(oldPaths, newPaths);
-  if (!rewrite) return [];
+  // The map may already have moved (re-planning after --migrate): read both.
+  const contexts = new Set([
+    ...contextRoots(root, oldPaths),
+    ...contextRoots(root, oldPaths, join(root, newPaths.contextMap)),
+  ]);
+  const contextPrefixes = [...contexts].filter((c) => c !== root).map((c) => rel(root, c));
+  const rewrite = referenceRewriter(oldPaths, newPaths, contextPrefixes) ?? ((span) => span);
+  const oldMapDir = dirname(join(root, oldPaths.contextMap));
+  const newMapDir = dirname(join(root, newPaths.contextMap));
+  const mapFiles = new Set([join(root, oldPaths.contextMap), join(root, newPaths.contextMap)].map(realpathOrNull));
   const candidates = [
     join(root, "AGENTS.md"),
     join(root, "CLAUDE.md"),
@@ -422,8 +511,10 @@ export function planReferenceRewrites(root, oldPaths, newPaths) {
       start !== -1 && end > start
         ? [before.slice(0, start), before.slice(start, end), before.slice(end)]
         : [before, "", ""];
-    const after = rewrite(head) + block + rewrite(tail);
-    if (after !== before) rewrites.push({ file, after });
+    // The context map's links were written for its old folder.
+    const rebase = (t) => (mapFiles.has(real) ? rebaseLinks(t, oldMapDir, newMapDir) : t);
+    const after = mapSpans(rebase(head), rewrite) + block + mapSpans(rebase(tail), rewrite);
+    if (after !== before) rewrites.push({ file, after, lines: changedLines(before, after) });
   }
   return rewrites;
 }
@@ -473,6 +564,7 @@ export function status(root) {
 
 export function apply(root, opts = {}) {
   const { dryRun = false, migrate = false, skipMigration = false, force = false, log = console.log } = opts;
+  if (migrate && skipMigration) throw new Error("--migrate and --skip-migration cannot be used together");
   const act = (msg, fn) => {
     log(`${dryRun ? "[dry-run] " : ""}${msg}`);
     if (!dryRun) fn();
@@ -488,28 +580,31 @@ export function apply(root, opts = {}) {
   const blocked = [];
   for (const c of copies) {
     if (c.original) continue;
-    if (c.state === "broken") {
-      blocked.push(`${c.key}: its saved originals under ${ORIGINALS_DIR} are missing or edited; reinstall it`);
-    } else if (!force) {
-      blocked.push(`${c.key}: edited since it was installed; reinstall it, or pass --force`);
-    } else {
-      // Files we rendered come back from their saved originals, so hand
-      // edits to them are lost: say which.
-      if (c.entry) {
-        const lost = c.entry.changed.filter((r) => {
-          const now = c.current.find((f) => f.rel === r);
-          const orig = c.rebuilt.find((f) => f.rel === r);
-          const expected = renderFiles(c.skill.name, [orig], lock.config.paths).files[0];
-          return !now || !now.content.equals(expected.content);
-        });
-        if (lost.length) log(`warning: --force drops edits to ${lost.map((r) => `${c.key}/${r}`).join(", ")}`);
-      }
-      c.original = c.rebuilt;
+    if (c.state === "broken" || !force) {
+      blocked.push(
+        c.state === "broken"
+          ? `${c.key}: its saved originals under ${ORIGINALS_DIR} are missing or edited; reinstall it:`
+          : `${c.key}: edited since it was installed; reinstall it, or pass --force:`,
+        `    npx skills add ${c.skill.source ?? "<source>"} --skill ${c.skill.name} --agent <the agents you installed for> -y${c.key.startsWith(".agents/") ? "" : " --copy"}`,
+      );
+      continue;
     }
+    // Files we rendered come back from their saved originals, so hand edits
+    // to them are lost: say which.
+    if (c.entry) {
+      const lost = c.entry.changed.filter((r) => {
+        const now = c.current.find((f) => f.rel === r);
+        const orig = c.rebuilt.find((f) => f.rel === r);
+        const expected = renderFiles(c.skill.name, [orig], lock.config.paths).files[0];
+        return !now || !now.content.equals(expected.content);
+      });
+      if (lost.length) log(`warning: --force drops edits to ${lost.map((r) => `${c.key}/${r}`).join(", ")}`);
+    }
+    c.original = c.rebuilt;
   }
   if (blocked.length) {
     throw new Error(
-      `cannot recover the original text of:\n  ${blocked.join("\n  ")}\nreinstall with \`npx skills add <source> --skill <name> -y\`, then re-run apply`,
+      `cannot recover the original text of:\n  ${blocked.join("\n  ")}\nreinstall with the commands shown, repeating the --agent (and --copy) flags of the original install, then re-run apply`,
     );
   }
 
@@ -541,7 +636,7 @@ export function apply(root, opts = {}) {
     } else if (!skipMigration && (moves.length || rewrites.length || problems.length || manual.length)) {
       const lines = [
         ...moves.map((m) => `move ${rel(root, m.src)} -> ${rel(root, m.dest)}`),
-        ...rewrites.map((r) => `update references in ${rel(root, r.file)}`),
+        ...rewrites.flatMap((r) => [`update references in ${rel(root, r.file)}:`, ...r.lines.map((l) => `    ${l}`)]),
         ...manual.map((m) => `move ${m} by hand`),
         ...problems.map((p) => `cannot migrate: ${p}`),
       ];

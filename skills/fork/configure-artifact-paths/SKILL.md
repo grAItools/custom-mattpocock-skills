@@ -28,7 +28,7 @@ If it fails because `skills-lock.json` or this skill is missing from it, tell th
 
 Present one table: key, what it is (the label), current value, default. Mark optional keys and say that `null` keeps the skill's own convention. Say that "per context" paths (`glossary`, `adrDir`) are relative to each context root, which is the repo root unless the project has several bounded contexts.
 
-Then ask once: which paths should change? The user answers with `key=value` pairs, or accepts the table as it is. Accept `default` to restore a default and `null` to clear an optional key. Repeat only if the user wants another change.
+Then ask once: which paths should change? The user answers with `key=value` pairs, or accepts the table as it is. Accept `default` to restore a default and `null` to clear an optional key (`./default` names a folder literally called `default`). Repeat only if the user wants another change.
 
 Mention any copy whose state is `modified` or `broken` now, since step 4 will stop on it.
 
@@ -42,8 +42,8 @@ Run `node <skill folder>/scripts/configure.mjs apply`. It rewrites the installed
 
 It stops, changing nothing, in two cases. Show the user what it printed and ask:
 
-- **Existing artifacts at the previous locations** (paths changed since the last apply; on the first apply, the previous locations are the upstream defaults, so a project that already has `CONTEXT.md` or `docs/adr/` lands here): move them (`--migrate`, which uses `git mv` for tracked files and updates references in `AGENTS.md`, `CLAUDE.md`, the context map and the setup config) or leave them (`--skip-migration`)? Re-run `apply` with the chosen flag. Lines starting `cannot migrate:` (a destination that already exists, a folder moved into itself, two moves that overlap) block `--migrate`: the user resolves them by hand or changes one path at a time. A moved teaching workspace is always moved by hand.
-- **A skill edited by hand**: reinstall it with `npx skills add <source> --skill <name> -y` and re-run `apply`, or re-run with `--force`. With `--force`, files the script had rewritten come back from their saved originals (their hand edits are dropped, and it names them); hand edits elsewhere are kept. A skill whose saved originals are missing must be reinstalled.
+- **Existing artifacts at the previous locations** (paths changed since the last apply; on the first apply, the previous locations are the upstream defaults, so a project that already has `CONTEXT.md` or `docs/adr/` lands here): move them (`--migrate`, which uses `git mv` for tracked files and updates path references in `AGENTS.md`, `CLAUDE.md`, the context map and the setup config; the message shows each line it would change) or leave them (`--skip-migration`)? Re-run `apply` with the chosen flag. Lines starting `cannot migrate:` (a destination that already exists, a folder moved into itself, two moves that overlap) block `--migrate`: the user resolves them by hand or changes one path at a time. A moved teaching workspace is always moved by hand.
+- **A skill edited by hand**: reinstall it with the `npx skills add` command the message prints (ask the user which agents they installed for, and repeat those `--agent` flags, plus `--copy` if the message shows it) and re-run `apply`, or re-run with `--force`. With `--force`, files the script had rewritten come back from their saved originals (their hand edits are dropped, and it names them); hand edits elsewhere are kept. A skill whose saved originals are missing must be reinstalled.
 
 ### 5. Finish
 

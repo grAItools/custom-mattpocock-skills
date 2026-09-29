@@ -26,3 +26,8 @@ jobs:
 
       - name: Guard
         run: node installer/guard.mjs
+
+      - name: Real npx skills round trip
+        run: node --test --test-name-pattern="real npx skills" installer/test/*.test.mjs
+        env:
+          REAL_SKILLS_CLI: "1"

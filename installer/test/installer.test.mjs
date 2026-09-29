@@ -423,7 +423,7 @@ test("dry-run migration lists a context map that moves", () => {
   apply(root, { log: (m) => logs.push(m), migrate: true, dryRun: true });
   assert.ok(logs.some((l) => l.includes("update path references in CONTEXT-MAP.md")), logs.join("\n"));
   apply(root, { log: quiet, migrate: true });
-  assert.equal(read(root, "domain/MAP.md"), "- [Ordering](./src/ordering/GLOSSARY.md)\n");
+  assert.equal(read(root, "domain/MAP.md"), "- [Ordering](../src/ordering/GLOSSARY.md)\n", "re-based for its new folder");
 });
 
 test("copies in nested agent folders are rendered; a project's own skills/ folder is not", () => {
@@ -479,4 +479,123 @@ test("cli: status, set, apply and check run end to end", () => {
   assert.match(run("check"), /match the configured paths/);
   writeFileSync(join(root, ".agents/skills/tdd/SKILL.md"), "edited");
   assert.throws(() => run("check"), (err) => err.status === 1 && /edited by hand/.test(err.stderr));
+});
+
+// ---------------------------------------------------------------- second review
+
+test("migration rewrites only path-shaped references, from a non-default value", () => {
+  const root = project();
+  setPaths(root, ["localTrackerDir=issues", "adrDir=decisions"]);
+  apply(root, { log: quiet });
+  mkdirSync(join(root, "issues"), { recursive: true });
+  mkdirSync(join(root, "docs/agents"), { recursive: true });
+  const config = [
+    "Implementation issues are one file per ticket at `issues/<feature-slug>/issues/<NN>-<slug>.md`.",
+    "Past decisions live in `decisions/` ([index](decisions/README.md)); see `other/decisions/`.",
+    "",
+  ].join("\n");
+  writeFileSync(join(root, "docs/agents/issue-tracker.md"), config);
+  setPaths(root, ["localTrackerDir=work/issues", "adrDir=docs/decisions"]);
+  assert.throws(
+    () => apply(root, { log: quiet }),
+    (err) => /\+ Implementation issues are one file per ticket at `work\/issues\/<feature-slug>\/issues\//.test(err.message),
+  );
+  apply(root, { log: quiet, migrate: true });
+  assert.equal(
+    read(root, "docs/agents/issue-tracker.md"),
+    [
+      "Implementation issues are one file per ticket at `work/issues/<feature-slug>/issues/<NN>-<slug>.md`.",
+      "Past decisions live in `docs/decisions/` ([index](docs/decisions/README.md)); see `other/decisions/`.",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("migration looks for per-context artifacts only where the context map points", () => {
+  const root = project();
+  apply(root, { log: quiet });
+  for (const dir of ["src/ordering", "third_party/lib", "build/docs/adr"]) mkdirSync(join(root, dir), { recursive: true });
+  writeFileSync(join(root, "src/ordering/CONTEXT.md"), "# Ordering\n");
+  writeFileSync(join(root, "third_party/lib/CONTEXT.md"), "# Vendored\n");
+  setPaths(root, ["glossary=GLOSSARY.md", "adrDir=decisions"]);
+  apply(root, { log: quiet, skipMigration: true });
+  assert.ok(existsSync(join(root, "third_party/lib/CONTEXT.md")), "no map: single context, nothing below the root");
+
+  const root2 = project();
+  apply(root2, { log: quiet });
+  for (const dir of ["src/ordering/docs/adr", "third_party/lib"]) mkdirSync(join(root2, dir), { recursive: true });
+  writeFileSync(join(root2, "src/ordering/CONTEXT.md"), "# Ordering\n");
+  writeFileSync(join(root2, "third_party/lib/CONTEXT.md"), "# Vendored\n");
+  writeFileSync(join(root2, "CONTEXT-MAP.md"), "- [Ordering](./src/ordering/CONTEXT.md)\n");
+  setPaths(root2, ["glossary=GLOSSARY.md", "adrDir=decisions"]);
+  apply(root2, { log: quiet, migrate: true });
+  assert.ok(existsSync(join(root2, "src/ordering/GLOSSARY.md")));
+  assert.ok(existsSync(join(root2, "src/ordering/decisions")));
+  assert.ok(existsSync(join(root2, "third_party/lib/CONTEXT.md")), "vendored copy untouched");
+});
+
+test("a dangling CLAUDE.md -> AGENTS.md symlink still means one file", () => {
+  const root = project();
+  symlinkSync("AGENTS.md", join(root, "CLAUDE.md"));
+  apply(root, { log: quiet });
+  const text = read(root, "AGENTS.md");
+  assert.match(text, /## Artifact locations/);
+  assert.doesNotMatch(text, /@AGENTS\.md/);
+  assert.deepEqual(check(root), []);
+});
+
+test("a symlinked skills folder is not counted as a second copy", () => {
+  const root = mkdtempSync(join(tmpdir(), "configure-paths-"));
+  skillsAdd(root, [SELF, "to-tickets"]);
+  rmSync(join(root, ".claude/skills"), { recursive: true });
+  symlinkSync("../.agents/skills", join(root, ".claude/skills"), "dir");
+  setPaths(root, ["localTrackerDir=work"]);
+  const lock = apply(root, { log: quiet });
+  assert.deepEqual(Object.keys(lock.copies), [".agents/skills/to-tickets"]);
+});
+
+test("reserved names are case-insensitive; ./default is a literal folder; flags conflict", () => {
+  for (const paths of [{ localTrackerDir: ".GIT/x" }, { adrDir: "Node_Modules/x" }, { glossary: "agents.md" }, { adrDir: ".Claude/Skills" }]) {
+    assert.throws(() => validateConfig({ paths }), undefined, JSON.stringify(paths));
+  }
+  const root = project();
+  setPaths(root, ["localTrackerDir=./default"]);
+  assert.equal(JSON.parse(read(root, CONFIG_FILE)).paths.localTrackerDir, "default");
+  assert.throws(() => apply(root, { log: quiet, migrate: true, skipMigration: true }), /cannot be used together/);
+});
+
+test("the reinstall hint names the source and the agent flags", () => {
+  const root = project({ mode: "copy" });
+  apply(root, { log: quiet });
+  writeFileSync(join(root, ".claude/skills/tdd/SKILL.md"), "edited");
+  assert.throws(
+    () => apply(root, { log: quiet }),
+    (err) =>
+      err.message.includes(`npx skills add ${SOURCE} --skill tdd --agent <the agents you installed for> -y --copy`) &&
+      err.message.includes("repeating the --agent (and --copy) flags"),
+  );
+});
+
+// Drives the real `skills` CLI. Needs network; opt in with REAL_SKILLS_CLI=1.
+test("real npx skills: install, configure, reinstall, re-apply", { skip: !process.env.REAL_SKILLS_CLI }, () => {
+  const repo = new URL("../..", import.meta.url).pathname;
+  const root = mkdtempSync(join(tmpdir(), "configure-paths-real-"));
+  const env = { ...process.env, DISABLE_TELEMETRY: "1" };
+  const skills = (...args) =>
+    execFileSync("npx", ["-y", "skills@1.7.0", "add", repo, "-y", "--agent", "claude-code", "codex", "opencode", ...args], {
+      cwd: root,
+      env,
+      stdio: "ignore",
+    });
+  execFileSync("git", ["init", "-q", root]);
+  skills("--skill", SELF, "domain-modeling", "to-tickets");
+  assert.ok(status(root).skills.every((s) => s.copies.every((c) => c.state === "original")), "hashes match the CLI");
+  setPaths(root, ["adrDir=decisions", "localTrackerDir=work"]);
+  apply(root, { log: quiet });
+  assert.deepEqual(check(root), []);
+  skills("--skill", "domain-modeling");
+  assert.ok(check(root).some((p) => p.includes("domain-modeling has the upstream paths")));
+  apply(root, { log: quiet });
+  assert.deepEqual(check(root), []);
+  assert.match(read(root, ".claude/skills/domain-modeling/ADR-FORMAT.md"), /`decisions\/`/);
 });

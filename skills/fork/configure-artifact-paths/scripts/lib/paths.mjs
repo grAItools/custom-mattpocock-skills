@@ -129,16 +129,18 @@ export function normalizePath(key, value) {
 }
 
 // Locations owned by git, package managers, the agents, or this skill.
+// Compared case-insensitively: macOS and Windows file systems usually are.
 function reservedReason(path) {
-  const [first] = path.split("/");
+  const p = path.toLowerCase();
+  const [first] = p.split("/");
   if (first === ".git" || first === "node_modules") return `${first}/ is not a place for project documents`;
-  if (/^\.[^/]+\/skills(\/|$)/.test(path) || /^\.(posit\/assistant|tabnine\/agent)\/skills(\/|$)/.test(path)) {
+  if (/^\.[^/]+\/skills(\/|$)/.test(p) || /^\.(posit\/assistant|tabnine\/agent)\/skills(\/|$)/.test(p)) {
     return "agent skill folders are managed by `npx skills`";
   }
-  if (path === ".agents/skill-paths" || path.startsWith(".agents/skill-paths/") || path.startsWith(".agents/skill-paths.")) {
+  if (p === ".agents/skill-paths" || p.startsWith(".agents/skill-paths/") || p.startsWith(".agents/skill-paths.")) {
     return "reserved for /configure-artifact-paths itself";
   }
-  if (["AGENTS.md", "CLAUDE.md", "skills-lock.json"].includes(path)) return "that file has another job";
+  if (["agents.md", "claude.md", "skills-lock.json"].includes(p)) return "that file has another job";
   return null;
 }
 
