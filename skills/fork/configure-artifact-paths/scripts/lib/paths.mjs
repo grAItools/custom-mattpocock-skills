@@ -8,7 +8,7 @@
 //                (e.g. `src/ordering/`) has its own copy.
 // Optional keys default to `null`, which keeps the upstream behaviour
 // (the skill picks a location by convention). `label` names the artifact in
-// the table the installer writes into AGENTS.md.
+// the table written into AGENTS.md.
 
 export const PATH_KEYS = {
   glossary: {
@@ -81,6 +81,7 @@ export const PATH_KEYS = {
 
 export const CONFIG_FILE = ".agents/skill-paths.json";
 export const LOCK_FILE = ".agents/skill-paths.lock.json";
+export const ORIGINALS_DIR = ".agents/skill-paths/originals";
 
 export function defaultPaths() {
   return Object.fromEntries(
@@ -88,14 +89,13 @@ export function defaultPaths() {
   );
 }
 
-export function defaultConfig() {
-  return { paths: defaultPaths(), extraSkills: [] };
-}
-
 const SAFE_PATH = /^[A-Za-z0-9._][A-Za-z0-9._/-]*$/;
 
-function normalizePath(key, value) {
+export function normalizePath(key, value) {
   const spec = PATH_KEYS[key];
+  if (!spec) {
+    throw new Error(`unknown path key ${JSON.stringify(key)}; known keys: ${Object.keys(PATH_KEYS).join(", ")}`);
+  }
   if (value === null) {
     if (spec.default !== null) {
       throw new Error(`paths.${key} cannot be null`);
@@ -131,7 +131,7 @@ export function validateConfig(raw) {
     throw new Error(`${CONFIG_FILE} must contain a JSON object`);
   }
   for (const key of Object.keys(raw)) {
-    if (!["$schema", "paths", "extraSkills"].includes(key)) {
+    if (!["$schema", "paths"].includes(key)) {
       throw new Error(`unknown top-level key ${JSON.stringify(key)} in ${CONFIG_FILE}`);
     }
   }
@@ -139,20 +139,10 @@ export function validateConfig(raw) {
   if (typeof rawPaths !== "object" || Array.isArray(rawPaths)) {
     throw new Error(`"paths" must be an object`);
   }
-  for (const key of Object.keys(rawPaths)) {
-    if (!(key in PATH_KEYS)) {
-      throw new Error(
-        `unknown path key ${JSON.stringify(key)}; known keys: ${Object.keys(PATH_KEYS).join(", ")}`,
-      );
-    }
-  }
+  for (const key of Object.keys(rawPaths)) normalizePath(key, rawPaths[key]);
   const paths = {};
   for (const key of Object.keys(PATH_KEYS)) {
     paths[key] = normalizePath(key, key in rawPaths ? rawPaths[key] : PATH_KEYS[key].default);
   }
-  const extraSkills = raw.extraSkills ?? [];
-  if (!Array.isArray(extraSkills) || extraSkills.some((s) => typeof s !== "string" || !/^[a-z0-9-]+$/.test(s))) {
-    throw new Error(`"extraSkills" must be a list of skill names`);
-  }
-  return { paths, extraSkills: [...new Set(extraSkills)].sort() };
+  return { paths };
 }

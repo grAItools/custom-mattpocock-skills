@@ -1,56 +1,51 @@
-# Per-project skills installer
+# Configurable artifact paths
 
-Fork-only tooling. It installs the skills into a project's repository with that project's artifact folders baked into the skill text, so every agent (Claude Code, OpenCode, Codex, oh-my-pi) reads literal, correct paths. Nothing here edits upstream files, which keeps merges from upstream conflict-free.
+Fork-only. Lets each project choose where the skills keep its files (glossary, ADRs, local issues, and more) while installing with the standard `npx skills` CLI. Nothing here edits upstream files, which keeps merges from upstream conflict-free.
 
-Requires Node 18.3 or later. No dependencies.
+The fork-only files are:
 
-## Install into a project
+- [`skills/fork/configure-artifact-paths/`](../skills/fork/configure-artifact-paths/SKILL.md): the user-invoked skill, with the renderer in `scripts/`.
+- `installer/`: this README, the upstream-sync guard and the tests.
+- `.github/workflows/installer.yml`: runs the tests and the guard.
+
+## Using it in a project
 
 ```sh
-git clone https://github.com/grAItools/custom-mattpocock-skills ~/src/custom-mattpocock-skills
-cd ~/src/my-project
-node ~/src/custom-mattpocock-skills/installer/install.mjs          # add --dry-run to preview
+npx skills@latest add graitools/custom-mattpocock-skills     # pick configure-artifact-paths along with the others
 ```
 
-The first run writes `.agents/skill-paths.json` with the upstream defaults. Edit it, re-run the installer, and commit the result.
+Then, in any agent, run `/configure-artifact-paths`. The agent shows every path with its default, asks which to override, and applies them. It runs `scripts/configure.mjs` from the installed skill, so it needs Node 18.3+ in the project and nothing else.
 
-What the installer writes into the project (commit all of it):
+Run `/configure-artifact-paths` again after every `npx skills add` or `npx skills update`: those put the upstream text back into the skills they touch. Until then, the `Artifact locations` table in `AGENTS.md` tells agents which paths win. For CI:
+
+```sh
+node .agents/skills/configure-artifact-paths/scripts/configure.mjs check
+```
+
+It fails when a skill still has the upstream paths, was edited by hand, or when the config changed without being applied.
+
+### What it writes (commit all of it)
 
 | Path | What |
 |---|---|
-| `.agents/skill-paths.json` | Your config. The only file you edit. |
-| `.agents/skills/<name>/` | Rendered skills. Codex, OpenCode and oh-my-pi read them here. |
-| `.claude/skills/<name>` | Symlink to the folder above, for Claude Code. `--claude-copy` copies instead (Windows without git symlinks). |
-| `AGENTS.md` | A managed `Artifact locations` block between `mattpocock-skills:paths` markers. The rest of the file is yours. |
-| `CLAUDE.md` | Gets an `@AGENTS.md` line, so Claude Code loads `AGENTS.md` as well. |
-| `.agents/skill-paths.lock.json` | What was installed, from which commit, with file hashes. |
+| `.agents/skill-paths.json` | The chosen paths. |
+| `.agents/skills/<name>/` | The skills `npx skills` installed, rewritten in place. `.claude/skills/` links to them in symlink mode; in copy mode each copy is rewritten. |
+| `.agents/skill-paths/originals/<name>/*.orig` | The upstream text of each file it changed, so a later run can start from it. |
+| `.agents/skill-paths.lock.json` | The applied config and a hash of each skill before and after. |
+| `AGENTS.md` | A generated `Artifact locations` block between `mattpocock-skills:paths` markers. The rest of the file is yours. |
+| `CLAUDE.md` | An `@AGENTS.md` line, so Claude Code reads `AGENTS.md` too. |
 
-Skills already in `.agents/skills/` or `.claude/skills/` that the installer did not create are left alone. If one has the same name as a skill being installed, the installer stops; `--force` replaces it.
+Only skills that `skills-lock.json` lists with the same source as `configure-artifact-paths` are touched. A skill that was edited by hand is left alone (the script stops and names it) unless you pass `--force`.
 
-Installed set: the promoted skills (the `skills` array of `.claude-plugin/plugin.json`), plus any names in `extraSkills` (e.g. `"pr"` from `in-progress/`).
+### How it tells what it is looking at
 
-## Config
+`npx skills` copies skills verbatim and records a hash of each (`computedHash` in `skills-lock.json`). The script computes the same hash, so for each installed skill it knows whether it is:
 
-```json
-{
-  "paths": {
-    "glossary": "docs/domain/GLOSSARY.md",
-    "contextMap": "docs/domain/CONTEXT-MAP.md",
-    "adrDir": "docs/architecture/decisions",
-    "skillsConfigDir": ".agents/config",
-    "localTrackerDir": "work",
-    "outOfScopeDir": "docs/rejected",
-    "teachDir": "learning",
-    "researchDir": "docs/research",
-    "handoffDir": ".handoffs",
-    "prototypeDir": "prototypes",
-    "wizardDir": "scripts/wizards"
-  },
-  "extraSkills": ["pr"]
-}
-```
+- **original**: matches `skills-lock.json` (fresh install or update). Rendered directly.
+- **configured**: matches its own lock. The original is rebuilt from the `.orig` files and rendered again.
+- **modified**: matches neither. Left alone unless forced.
 
-Every key is optional; a missing key keeps the upstream default.
+### The paths
 
 | Key | Default | Relative to | Used by |
 |---|---|---|---|
@@ -66,26 +61,9 @@ Every key is optional; a missing key keeps the upstream default.
 | `prototypeDir` | `null` | repo root | prototype (standalone prototypes only; UI routes still follow the app's routing) |
 | `wizardDir` | `null` | repo root | wizard |
 
-"Each context root" is the repo root in a single-context project, and each context folder (e.g. `src/ordering/`) in a multi-context one, so `adrDir: "docs/decisions"` means `docs/decisions/` at the root and `src/ordering/docs/decisions/` per context. `null` keeps the skill's own convention (for `handoffDir`, the OS temp directory).
+"Each context root" is the repo root in a single-context project, and each context folder (e.g. `src/ordering/`) in a multi-context one. `null` keeps the skill's own convention (for `handoffDir`, the OS temp directory).
 
-## Changing a path later
-
-Edit the config and re-run the installer. If artifacts already exist at the old location, the installer stops and lists them:
-
-- `--migrate` moves them (with `git mv` when tracked), including per-context copies, and rewrites references to the old paths in `AGENTS.md`, `CLAUDE.md`, the context map and the files in `skillsConfigDir`. Links elsewhere in your docs are not rewritten. A changed `teachDir` is reported but not moved.
-- `--skip-migration` installs anyway and leaves them where they are.
-
-## Updating the skills
-
-`git pull` in the fork clone, then re-run the installer in each project and commit.
-
-## Checking a project in CI
-
-```sh
-node path/to/custom-mattpocock-skills/installer/install.mjs --check
-```
-
-This compares the project against its lock file only, so any checkout of the fork works. It fails when a rendered skill was edited by hand, when the config changed without a re-install, or when the `AGENTS.md` block or the `@AGENTS.md` import is missing.
+When paths change and artifacts already exist at the old ones, `apply` stops and lists them: `--migrate` moves them (with `git mv` when tracked, including per-context copies) and rewrites references in `AGENTS.md`, `CLAUDE.md`, the context map and the files in `skillsConfigDir`; `--skip-migration` leaves them. A changed `teachDir` is reported, not moved.
 
 ## Keeping the fork in sync with upstream
 
@@ -96,17 +74,15 @@ git merge upstream/main
 node --test installer/test/*.test.mjs && node installer/guard.mjs
 ```
 
-Merge rather than rebase: `main` is published. The installer only adds files, so the merge itself does not conflict on its account.
+Merge rather than rebase: `main` is published.
 
-The guard renders every skill with every path set to a sentinel value and fails when:
+The guard renders every skill (except `deprecated/`) with every path set to a sentinel value and fails when:
 
-- **a rule matched nothing**: upstream reworded the sentence that rule targets. Update its `find` text in [rules.mjs](./rules.mjs).
+- **a rule matched nothing**: upstream reworded the sentence that rule targets. Update its text in [rules.mjs](../skills/fork/configure-artifact-paths/scripts/lib/rules.mjs).
 - **a default path survived**: upstream added a reference in a form the rules do not cover (a new tree layout, a new folder). Add or extend a rule.
-
-CI runs the same two commands on every push ([.github/workflows/installer.yml](../.github/workflows/installer.yml)).
 
 ## How rendering works
 
-[rules.mjs](./rules.mjs) holds the rules. Most references are plain tokens (`CONTEXT.md`, `docs/adr`, `.scratch`, ...) replaced wherever they appear, including inside per-context paths like `src/<context>/docs/adr/`. Skills with no fixed path (research, handoff, prototype, wizard, teach) get a targeted sentence rewrite, applied only when the key is set. One rule is not about paths: it makes `/setup-matt-pocock-skills` write its `## Agent skills` block to `AGENTS.md`, since Codex does not read `CLAUDE.md`.
+Most references are plain tokens (`CONTEXT.md`, `docs/adr`, `.scratch`, ...) replaced wherever they appear, including inside per-context paths like `src/<context>/docs/adr/`. Skills with no fixed path (research, handoff, prototype, wizard, teach) get a targeted sentence rewrite, applied only when the key is set. One rule is not about paths: it makes `/setup-matt-pocock-skills` write its `## Agent skills` block to `AGENTS.md`, since Codex does not read `CLAUDE.md`.
 
 Rules first replace matches with placeholders and only then substitute values, so a configured value is never rewritten by a later rule. With the default config, every skill renders byte-identical to upstream except `setup-matt-pocock-skills/SKILL.md`.

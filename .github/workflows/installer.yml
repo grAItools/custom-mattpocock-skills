@@ -1,8 +1,8 @@
 name: Installer
 
-# Fork-only: keeps the per-project installer in step with upstream skills.
+# Fork-only: keeps /configure-artifact-paths in step with upstream skills.
 # A failing guard after an upstream merge means a rewrite rule in
-# installer/rules.mjs needs updating.
+# skills/fork/configure-artifact-paths/scripts/lib/rules.mjs needs updating.
 
 on:
   push:

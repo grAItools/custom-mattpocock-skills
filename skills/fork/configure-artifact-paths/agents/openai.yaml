@@ -1,0 +1,5 @@
+interface:
+  display_name: "Configure Artifact Paths"
+  short_description: "Choose where skills keep project files"
+policy:
+  allow_implicit_invocation: false
