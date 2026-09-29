@@ -8,6 +8,11 @@ on:
   push:
   pull_request:
 
+# Runs on the upstream-sync branch too, i.e. on upstream's code: read-only,
+# and no credentials left in the checkout.
+permissions:
+  contents: read
+
 jobs:
   installer:
     name: Tests and upstream-sync guard
@@ -15,6 +20,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4

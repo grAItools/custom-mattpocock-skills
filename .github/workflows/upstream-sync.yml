@@ -45,7 +45,6 @@ jobs:
       bundled: ${{ steps.merge.outputs.bundled }}
       conflict: ${{ steps.merge.outputs.conflict }}
       conflicts: ${{ steps.merge.outputs.conflicts }}
-      touches_protected: ${{ steps.merge.outputs.touches_protected }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -105,14 +104,6 @@ jobs:
           git merge --no-ff --no-edit -m "Merge upstream mattpocock/skills@${TARGET:0:7}" "$TARGET" ||
             conflicted upstream
           echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          # Upstream's own changes to workflows or fork-owned code run with
-          # this repo's permissions or change the checks: never auto-merge
-          # them. Fixes pushed to the sync branch by people are not counted.
-          if git diff --quiet "$(git merge-base main "$TARGET")" "$TARGET" -- .github installer skills/fork; then
-            echo "touches_protected=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "touches_protected=true" >> "$GITHUB_OUTPUT"
-          fi
           # Hand over only the new commits; the publish job has the rest. A
           # re-run with nothing new has none: the sync branch is already it.
           if git rev-parse -q --verify "origin/$SYNC_BRANCH" >/dev/null &&
@@ -160,6 +151,10 @@ jobs:
     if: >-
       !cancelled() && vars.SYNC_APP_ID != '' && needs.check.result != 'skipped'
     runs-on: ubuntu-latest
+    # The App's private key lives in this environment, whose deployment
+    # branch policy allows only main (installer/README.md, setup step 2), so
+    # no workflow on another branch can read it.
+    environment: upstream-sync
     permissions:
       contents: read
     env:
@@ -170,7 +165,6 @@ jobs:
       BUNDLED: ${{ needs.check.outputs.bundled }}
       CONFLICT: ${{ needs.check.outputs.conflict }}
       CONFLICTS: ${{ needs.check.outputs.conflicts }}
-      TOUCHES_PROTECTED: ${{ needs.check.outputs.touches_protected }}
       CHECKS_OK: ${{ needs.check.result == 'success' }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
@@ -197,8 +191,8 @@ jobs:
           name: sync-bundle
           path: ${{ runner.temp }}
 
-      # The bundle was uploaded after the checks ran, so trust nothing in it
-      # but the commit the check job recorded before running them.
+      # Trust nothing the check job produced after running upstream code:
+      # re-derive everything here from git objects, executing nothing.
       - name: Verify and push
         id: push
         if: env.HEAD_SHA != ''
@@ -212,18 +206,52 @@ jobs:
             # Nothing new: the checked commit is the sync branch as it is.
             test "$(git rev-parse "origin/$SYNC_BRANCH")" = "$HEAD_SHA"
           fi
-          # It must contain both the main and the upstream commit it was
-          # checked against.
+          # It must contain the main and the upstream commit it was checked
+          # against, and every new commit must be either upstream's own or a
+          # clean merge whose tree git reproduces here: nothing else can have
+          # been slipped in.
           git merge-base --is-ancestor "$BASE" "$HEAD_SHA"
           git merge-base --is-ancestor "$TARGET" "$HEAD_SHA"
+          known=(^"$BASE")
+          if git rev-parse -q --verify "origin/$SYNC_BRANCH" >/dev/null; then known+=(^"origin/$SYNC_BRANCH"); fi
+          for c in $(git rev-list "$HEAD_SHA" "${known[@]}"); do
+            if git merge-base --is-ancestor "$c" "$TARGET"; then continue; fi
+            read -r -a parents <<< "$(git rev-list --parents -n 1 "$c" | cut -d' ' -f2-)"
+            test "${#parents[@]}" -eq 2
+            test "$(git merge-tree --write-tree "${parents[0]}" "${parents[1]}")" = "$(git rev-parse "$c^{tree}")"
+          done
+          # What upstream itself changed since the fork last had it.
+          upstream_base=$(git merge-base "$BASE" "$TARGET")
+          echo "upstream_base=$upstream_base" >> "$GITHUB_OUTPUT"
+          if git diff --quiet "$upstream_base" "$TARGET" -- .github installer skills/fork; then
+            echo "touches_protected=false" >> "$GITHUB_OUTPUT"; protected=false
+          else
+            echo "touches_protected=true" >> "$GITHUB_OUTPUT"; protected=true
+          fi
+          # Upstream workflow changes are never pushed: a pushed branch runs
+          # the workflow files it contains, with this repo's secrets.
+          if ! git diff --quiet "$upstream_base" "$TARGET" -- .github; then
+            echo "touches_github=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Switch off an auto-merge left from an earlier run before pushing
+          # a head that must not merge by itself; stop if that fails.
+          if [ "$CHECKS_OK" != true ] || [ "$protected" = true ]; then
+            if [ "$(gh pr view "$SYNC_BRANCH" --json state,autoMergeRequest \
+                    -q '.state == "OPEN" and .autoMergeRequest != null' 2>/dev/null)" = true ]; then
+              gh pr merge "$SYNC_BRANCH" --disable-auto
+            fi
+          fi
           git push -q "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
             "$HEAD_SHA:refs/heads/$SYNC_BRANCH"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
 
       - name: Open, update and merge the sync PR
         id: pr
-        if: steps.push.outcome == 'success'
+        if: steps.push.outputs.pushed == 'true'
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          TOUCHES_PROTECTED: ${{ steps.push.outputs.touches_protected }}
         run: |
           title="Sync upstream mattpocock/skills@${TARGET:0:7}"
           body="Merges upstream \`${TARGET}\`. Created by the Upstream sync workflow: ${RUN_URL}"
@@ -237,15 +265,16 @@ jobs:
             gh pr create --base main --head "$SYNC_BRANCH" --title "$title" --body "$body"
           fi
           if [ "$CHECKS_OK" != true ] || [ "$TOUCHES_PROTECTED" != false ]; then
-            gh pr merge "$SYNC_BRANCH" --disable-auto 2>/dev/null || true
-            exit 0
+            exit 0 # auto-merge was already switched off before the push
           fi
           # Merge only onto the main that was checked. `gh pr merge --auto`
           # merges at once when the PR is already mergeable, so this must be
           # decided before any merge call. If main moved, the next run merges
           # it into the branch and checks again.
           if [ "$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" -q .object.sha)" != "$BASE" ]; then
-            gh pr merge "$SYNC_BRANCH" --disable-auto 2>/dev/null || true
+            if [ "$(gh pr view "$SYNC_BRANCH" --json autoMergeRequest -q '.autoMergeRequest != null')" = true ]; then
+              gh pr merge "$SYNC_BRANCH" --disable-auto
+            fi
             echo "state=main-moved" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -272,6 +301,9 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           PUSHED: ${{ steps.push.outcome }}
+          TOUCHES_GITHUB: ${{ steps.push.outputs.touches_github }}
+          TOUCHES_PROTECTED: ${{ steps.push.outputs.touches_protected }}
+          UPSTREAM_BASE: ${{ steps.push.outputs.upstream_base }}
           PR_STATE: ${{ steps.pr.outputs.state }}
         run: |
           # One reason per run, most specific first; `code` de-duplicates.
@@ -285,6 +317,8 @@ jobs:
             code=merge-error; reason="Merging failed without a conflict (for example rewritten upstream history); see the run log."
           elif [ -n "$HEAD_SHA" ] && [ "$PUSHED" != success ]; then
             code=push; reason="The checked merge could not be verified or pushed; see the run log."
+          elif [ "$TOUCHES_GITHUB" = true ]; then
+            code=github; reason="Upstream changed .github/. So that none of upstream's workflow files ever run here, the sync branch was not pushed. Review https://github.com/mattpocock/skills/compare/${UPSTREAM_BASE}...${TARGET} and merge by hand (installer/README.md, \"By hand\")."
           elif [ "$CHECKS_OK" != true ]; then
             code=checks; reason="The check job failed: fetching upstream, or a fork check on the merged tree (invariants, tests, guard, npx skills round trip)."
           elif [ "$TOUCHES_PROTECTED" = true ]; then
@@ -305,14 +339,21 @@ jobs:
           fi
           existing=$(gh issue list --label upstream-sync --state open --json number -q '.[0].number')
           if [ "$code" = synced ]; then
-            # main has upstream: close a report still open from earlier.
+            # main has upstream: close a report still open from earlier, and
+            # a sync PR left behind if main got there another way (only when
+            # main already contains everything on its branch).
             if [ -n "$existing" ]; then
               gh issue close "$existing" --comment "main now contains upstream \`${TARGET}\`. ${RUN_URL}"
             fi
+            if [ "$(gh pr view "$SYNC_BRANCH" --json state -q .state 2>/dev/null)" = OPEN ] &&
+               git merge-base --is-ancestor "origin/$SYNC_BRANCH" main; then
+              gh pr close "$SYNC_BRANCH" --delete-branch --comment "main already contains this branch. ${RUN_URL}"
+            fi
             exit 0
           fi
-          marker="<!-- upstream-sync:${TARGET}:${code} -->"
-          body="Upstream \`${TARGET}\` could not be synced automatically. ${reason} Run: ${RUN_URL}
+          # Without a target (fetching upstream failed) de-duplicate per run.
+          marker="<!-- upstream-sync:${TARGET:-run-$GITHUB_RUN_ID}:${code} -->"
+          body="Upstream \`${TARGET:-unknown}\` could not be synced automatically. ${reason} Run: ${RUN_URL}
           ${marker}"
           if [ -n "$existing" ]; then
             seen=$(gh issue view "$existing" --json body,comments -q '.body, .comments[].body')
