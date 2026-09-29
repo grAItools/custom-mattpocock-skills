@@ -249,6 +249,8 @@ jobs:
              [ "$(gh pr list --head "$SYNC_BRANCH" --state open --json autoMergeRequest \
                   -q '.[0].autoMergeRequest != null')" = true ]; then
             gh pr merge "$SYNC_BRANCH" --disable-auto
+            # For the stall report: auto-merge was already waiting before.
+            echo "auto_was_on=true" >> "$GITHUB_OUTPUT"
           fi
           git push -q "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
             "$HEAD_SHA:refs/heads/$SYNC_BRANCH"
@@ -293,7 +295,7 @@ jobs:
           # Auto-merge already on for this exact head: leave it on.
           if [ "$(gh pr view "$SYNC_BRANCH" --json autoMergeRequest,headRefOid \
                   -q '(.autoMergeRequest != null) and (.headRefOid == "'"$HEAD_SHA"'")')" = true ]; then
-            echo "state=auto" >> "$GITHUB_OUTPUT"
+            echo "state=auto-waiting" >> "$GITHUB_OUTPUT"
           elif gh pr merge "$SYNC_BRANCH" --auto --merge --match-head-commit "$HEAD_SHA"; then
             if [ "$(gh pr view "$SYNC_BRANCH" --json state -q .state)" = MERGED ]; then
               echo "state=merged" >> "$GITHUB_OUTPUT"
@@ -307,23 +309,45 @@ jobs:
             echo "state=refused" >> "$GITHUB_OUTPUT"
           fi
 
+      # The check job's "up to date" can close the report issue, so confirm
+      # it here from git objects instead of taking it on that job's word.
+      - name: Confirm up to date
+        id: current
+        if: env.UP_TO_DATE == 'true' && env.HEAD_SHA == ''
+        run: |
+          [[ "$TARGET" =~ ^[0-9a-f]{40}$ ]]
+          git fetch -q --no-tags "$UPSTREAM_URL" "$UPSTREAM_REF"
+          git merge-base --is-ancestor "$TARGET" FETCH_HEAD
+          git merge-base --is-ancestor "$TARGET" main
+          echo "confirmed=true" >> "$GITHUB_OUTPUT"
+
       - name: Report
         if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          UP_TO_DATE_CONFIRMED: ${{ steps.current.outputs.confirmed }}
+          AUTO_WAS_ON: ${{ steps.push.outputs.auto_was_on }}
           PUSHED: ${{ steps.push.outcome }}
           TOUCHES_GITHUB: ${{ steps.push.outputs.touches_github }}
           TOUCHES_PROTECTED: ${{ steps.push.outputs.touches_protected }}
           UPSTREAM_BASE: ${{ steps.push.outputs.upstream_base }}
           PR_STATE: ${{ steps.pr.outputs.state }}
         run: |
+          # Values from the check job end up in issue text: accept only a
+          # commit id as the target, and show conflicted file names (which
+          # come from upstream) verbatim in a fenced block.
+          [[ "$TARGET" =~ ^[0-9a-f]{40}$ ]] || TARGET=""
+          files=$(printf '%s\n' "$CONFLICTS" | tr -d '\140~' | sed '/^$/d' | head -n 50)
+          fenced=$(printf '\n\n\140\140\140\n%s\n\140\140\140\n' "$files")
           # One reason per run, most specific first; `code` de-duplicates.
-          if [ "$UP_TO_DATE" = true ]; then
+          if [ "$UP_TO_DATE_CONFIRMED" = true ]; then
             code=synced
+          elif [ "$UP_TO_DATE" = true ] && [ -z "$HEAD_SHA" ]; then
+            code=unconfirmed; reason="The check job reported main up to date with upstream, but that could not be confirmed; see the run log."
           elif [ "$CONFLICT" = upstream ]; then
-            code=conflict; reason="Merging upstream conflicts in: $(echo "$CONFLICTS" | tr '\n' ' ')"
+            code=conflict; reason="Merging upstream conflicts in these files:${fenced}"
           elif [ "$CONFLICT" = main ]; then
-            code=conflict-main; reason="The open upstream-sync branch conflicts with main in: $(echo "$CONFLICTS" | tr '\n' ' ')"
+            code=conflict-main; reason="The open upstream-sync branch conflicts with main in these files:${fenced}"
           elif [ "$CONFLICT" = error ]; then
             code=merge-error; reason="Merging failed without a conflict (for example rewritten upstream history); see the run log."
           elif [ -n "$HEAD_SHA" ] && [ "$PUSHED" != success ]; then
@@ -339,10 +363,14 @@ jobs:
           elif [ "$PR_STATE" = main-moved ]; then
             echo "main moved during the run; the next run merges it and checks again." >> "$GITHUB_STEP_SUMMARY"
             exit 0
-          elif [ "$PR_STATE" = auto ]; then
-            # Timed from the PR's creation, which new heads do not reset: a
-            # PR that can never auto-merge must not stay silent while
-            # upstream keeps moving.
+          elif [ "$PR_STATE" = auto ] || [ "$PR_STATE" = auto-waiting ]; then
+            # Stalled: auto-merge was already waiting before this run (on
+            # this head, or on the one this run replaced), and the PR is over
+            # a day old. Timed from the PR's creation, which new heads do not
+            # reset, but never on the run that first switches auto-merge on.
+            if [ "$PR_STATE" != auto-waiting ] && [ "$AUTO_WAS_ON" != true ]; then
+              exit 0 # just enabled: the required check has only started
+            fi
             if [ "$(gh pr view "$SYNC_BRANCH" --json createdAt \
                     -q '.createdAt | fromdateiso8601 < (now - 86400)')" != true ]; then
               exit 0 # waiting on the required check
@@ -354,22 +382,24 @@ jobs:
           existing=$(gh issue list --label upstream-sync --state open --json number -q '.[0].number')
           if [ "$code" = synced ]; then
             # main has upstream: close a report still open from earlier, and
-            # a sync PR left behind if main got there another way (only when
-            # main already contains everything on its branch).
+            # a sync PR left behind if main got there another way, but only
+            # when main already has the branch's content (the branch is an
+            # ancestor of main, or has the same tree after a by-hand merge).
             if [ -n "$existing" ]; then
               gh issue close "$existing" --comment "main now contains upstream \`${TARGET}\`. ${RUN_URL}"
             fi
-            # (as an ancestor, or with the same tree after a by-hand merge).
             if [ "$(gh pr view "$SYNC_BRANCH" --json state -q .state 2>/dev/null)" = OPEN ] &&
                { git merge-base --is-ancestor "origin/$SYNC_BRANCH" main ||
                  git diff --quiet main "origin/$SYNC_BRANCH"; }; then
-              gh pr close "$SYNC_BRANCH" --delete-branch --comment "main already contains this branch. ${RUN_URL}"
+              gh pr close "$SYNC_BRANCH" --delete-branch --comment "main already has this branch's content. ${RUN_URL}"
             fi
             exit 0
           fi
           # Without a target (fetching upstream failed) de-duplicate per run.
           marker="<!-- upstream-sync:${TARGET:-run-$GITHUB_RUN_ID}:${code} -->"
-          body="Upstream \`${TARGET:-unknown}\` could not be synced automatically. ${reason} Run: ${RUN_URL}
+          body="Upstream \`${TARGET:-unknown}\` could not be synced automatically. ${reason}
+
+          Run: ${RUN_URL}
           ${marker}"
           if [ -n "$existing" ]; then
             seen=$(gh issue view "$existing" --json body,comments -q '.body, .comments[].body')
