@@ -1,12 +1,15 @@
 # Configurable artifact paths
 
-Fork-only. Lets each project choose where the skills keep its files (glossary, ADRs, local issues, and more) while installing with the standard `npx skills` CLI. Nothing here edits upstream files, which keeps merges from upstream conflict-free.
+Fork-only. Lets each project choose where the skills keep its files (glossary, ADRs, local issues, and more) while installing with the standard `npx skills` CLI, and keeps the fork in step with upstream. The fork adds files and edits a single upstream line, which keeps merges from upstream conflict-free in practice.
 
 The fork-only files are:
 
 - [`skills/fork/configure-artifact-paths/`](../skills/fork/configure-artifact-paths/SKILL.md): the user-invoked skill, with the renderer in `scripts/`.
 - `installer/`: this README, the upstream-sync guard and the tests.
 - `.github/workflows/installer.yml`: runs the tests and the guard.
+- `.github/workflows/upstream-sync.yml`: merges upstream into `main` every 6 hours when everything passes (see [Upstream sync](#upstream-sync)).
+
+The one upstream file the fork edits is `.github/workflows/release.yml`: its changesets job runs only in `mattpocock/skills` (`if: github.repository == 'mattpocock/skills'`), so the fork never opens version PRs.
 
 ## Using it in a project
 
@@ -69,7 +72,30 @@ Only skills that `skills-lock.json` lists with the same source as `configure-art
 
 When paths change and artifacts already exist at the previous ones, `apply` stops and lists them. On the first apply the previous paths are the upstream defaults, so a project already using the skills gets the same prompt. `--migrate` moves them (with `git mv` when tracked, including per-context copies) and rewrites references in `AGENTS.md`, `CLAUDE.md`, the context map and the files in `skillsConfigDir`; `--skip-migration` leaves them. References are only rewritten where they look like paths: inside code spans and link targets, at the start of the path (or after a `/` for the per-context glossary and ADR folder), and in one pass so a new path is never rewritten again. Prose is never touched, and the stop message shows every line that would change. Code spans are read as repo-relative paths. Claude Code `@path` imports in `AGENTS.md` and `CLAUDE.md` are updated too. Link targets are read relative to their file: each is resolved against the folder the file was written in, rewritten, then made relative to the folder the file ends up in, so links in a context map that moves (or sits in a subfolder) keep pointing at the artifacts wherever they moved. If a move fails midway, fix the cause and re-run `--migrate`: moves already done are skipped and the reference updates still run. Per-context artifacts are looked for at the repo root and in each context the context map links to (by its glossary or ADR folder); without a context map the project is single-context. Ignored, vendored and dependency folders are never scanned. Every move is checked before any runs: a destination that already exists, a folder moved into itself, or two overlapping moves blocks `--migrate`. A changed `teachDir` is listed but always moved by hand.
 
-## Keeping the fork in sync with upstream
+## Upstream sync
+
+`.github/workflows/upstream-sync.yml` runs every 6 hours (and on demand from the Actions tab) and keeps `main` within a day of upstream `main`, which is what `npx skills add mattpocock/skills` installs:
+
+1. It merges upstream `main` into an `upstream-sync` branch cut from `main` (a merge commit, never a rebase). A branch left open by an earlier blocked run is built on, so fixes pushed to it survive.
+2. On the merged tree it checks that the `release.yml` guard line is still there, then runs the tests, the guard and the real `npx skills` round trips.
+3. It pushes the branch, opens or updates one PR, and enables auto-merge only when every check passed and upstream did not touch `.github/`, `installer/` or `skills/fork/`.
+4. Anything else (a merge conflict, a failing check, a protected path changed) leaves the PR open without auto-merge, or unopened on a conflict, and comments once per upstream commit on a single issue labelled `upstream-sync`.
+
+The token never reaches the checks: checkout does not store it, and only the push and `gh` steps see it.
+
+### One-time setup
+
+Until `SYNC_APP_ID` exists the job is skipped, so the workflow is harmless before this.
+
+1. **Create a GitHub App** (Settings, Developer settings, GitHub Apps, New). No webhook. Repository permissions: *Contents*, *Pull requests*, *Issues* and *Workflows*, all read and write. Install it on this repository only.
+2. **Store its credentials** in this repository (Settings, Secrets and variables, Actions): the App ID as the variable `SYNC_APP_ID`, a generated private key as the secret `SYNC_APP_PRIVATE_KEY`.
+3. **Allow auto-merge**: Settings, General, Pull Requests, "Allow auto-merge".
+4. **Protect `main`** with a ruleset or branch protection that requires the status check "Tests and upstream-sync guard". Auto-merge then waits for it. Without protection the workflow merges at once, which is still safe: the same checks already passed on the exact tree.
+5. **Run it once by hand** (Actions, Upstream sync, Run workflow) and check the run: with nothing new upstream it reports "Up to date".
+
+GitHub may delay scheduled runs, and in a public repository disables scheduled workflows after 60 days without activity (it emails you; re-enable it from the Actions tab).
+
+### By hand
 
 ```sh
 git remote add upstream https://github.com/mattpocock/skills   # once

@@ -1,0 +1,176 @@
+name: Upstream sync
+
+# Fork-only. Merges mattpocock/skills main into this fork's main, but only
+# after the fork's own checks pass on the merged tree. Anything that needs a
+# human (a merge conflict, a failing check, upstream touching .github/ or the
+# fork's own code) lands as an open PR plus one tracking issue instead of on
+# main. Setup: installer/README.md, "Upstream sync".
+
+on:
+  schedule:
+    - cron: "17 */6 * * *" # every 6 hours: the 24h bound survives delays and a failed run
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_URL: https://github.com/mattpocock/skills.git
+  UPSTREAM_REF: main
+  SYNC_BRANCH: upstream-sync
+
+jobs:
+  sync:
+    # Inert until the GitHub App is set up (the SYNC_APP_ID variable exists).
+    if: vars.SYNC_APP_ID != ''
+    runs-on: ubuntu-latest
+    steps:
+      # A GitHub App token, not GITHUB_TOKEN: pushes and PRs made with it
+      # trigger the fork's own workflows, and it can carry the `workflows`
+      # permission needed to push upstream changes under .github/workflows.
+      - name: App token
+        id: app
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.SYNC_APP_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token }}
+          # Checks below run on upstream files: keep the token out of
+          # .git/config so nothing they execute can read it.
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream "$UPSTREAM_REF"
+          target=$(git rev-parse FETCH_HEAD)
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$target" HEAD; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "Up to date with upstream ${target:0:7}." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Merge upstream
+        id: merge
+        if: steps.fetch.outputs.up_to_date != 'true'
+        env:
+          TARGET: ${{ steps.fetch.outputs.target }}
+        run: |
+          git config user.name "upstream-sync[bot]"
+          git config user.email "upstream-sync[bot]@users.noreply.github.com"
+          # Build on an open sync branch, so fixes pushed to it survive; start
+          # fresh from main once the last sync has been merged.
+          if git rev-parse -q --verify "origin/$SYNC_BRANCH" >/dev/null &&
+             ! git merge-base --is-ancestor "origin/$SYNC_BRANCH" HEAD; then
+            git switch -C "$SYNC_BRANCH" "origin/$SYNC_BRANCH"
+            git merge --no-edit main
+          else
+            git switch -C "$SYNC_BRANCH"
+          fi
+          if ! git merge --no-ff --no-edit -m "Merge upstream mattpocock/skills@${TARGET:0:7}" "$TARGET"; then
+            {
+              echo "conflicts<<EOF"
+              git diff --name-only --diff-filter=U
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            git merge --abort
+            exit 1
+          fi
+          # Upstream changes to workflows or to fork-owned code run with this
+          # repo's permissions or change the checks themselves: never
+          # auto-merge them.
+          if git diff --quiet main HEAD -- .github installer skills/fork; then
+            echo "touches_protected=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "touches_protected=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fork invariants
+        if: steps.merge.outcome == 'success'
+        run: |
+          # The upstream release job must stay switched off in the fork.
+          grep -q "if: github.repository == 'mattpocock/skills'" .github/workflows/release.yml
+
+      - name: Tests
+        if: steps.merge.outcome == 'success'
+        run: node --test installer/test/*.test.mjs
+
+      - name: Upstream-sync guard
+        if: steps.merge.outcome == 'success'
+        run: node installer/guard.mjs
+
+      - name: Real npx skills round trip
+        if: steps.merge.outcome == 'success'
+        run: node --test --test-name-pattern="real npx skills" installer/test/*.test.mjs
+        env:
+          REAL_SKILLS_CLI: "1"
+
+      # Publish the merge whether or not the checks passed, so a human (or an
+      # agent) can fix it on the branch; only a clean result gets auto-merge.
+      - name: Open or update the sync PR
+        id: pr
+        if: always() && steps.merge.outcome != 'skipped' && steps.merge.outputs.conflicts == ''
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TARGET: ${{ steps.fetch.outputs.target }}
+          CHECKS_OK: ${{ job.status == 'success' }}
+          TOUCHES_PROTECTED: ${{ steps.merge.outputs.touches_protected }}
+        run: |
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$SYNC_BRANCH"
+          title="Sync upstream mattpocock/skills@${TARGET:0:7}"
+          body="Merges upstream \`${TARGET}\`. Created by the Upstream sync workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if ! gh pr view "$SYNC_BRANCH" --json state -q .state 2>/dev/null | grep -q OPEN; then
+            gh pr create --base main --head "$SYNC_BRANCH" --title "$title" --body "$body"
+          else
+            gh pr edit "$SYNC_BRANCH" --title "$title" --body "$body"
+          fi
+          if [ "$CHECKS_OK" = true ] && [ "$TOUCHES_PROTECTED" = false ]; then
+            # Auto-merge waits for required checks; without branch protection
+            # it is unavailable, and the checks above already passed on this
+            # exact tree, so merge now.
+            gh pr merge "$SYNC_BRANCH" --auto --merge || gh pr merge "$SYNC_BRANCH" --merge
+          else
+            gh pr merge "$SYNC_BRANCH" --disable-auto || true
+          fi
+
+      - name: Report a blocked sync
+        if: failure() || steps.merge.outputs.touches_protected == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TARGET: ${{ steps.fetch.outputs.target }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          TOUCHES_PROTECTED: ${{ steps.merge.outputs.touches_protected }}
+        run: |
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [ -n "$CONFLICTS" ]; then
+            reason="Merge conflict in: $(echo "$CONFLICTS" | tr '\n' ' ')"
+          elif [ "$TOUCHES_PROTECTED" = true ] && [ "${{ job.status }}" = success ]; then
+            reason="Upstream changed .github/, installer/ or skills/fork/: review the sync PR by hand before merging."
+          else
+            reason="A fork check failed on the merged tree (tests, guard, or invariants)."
+          fi
+          body="Upstream \`${TARGET}\` could not be synced automatically. ${reason} Run: ${run_url}"
+          existing=$(gh issue list --label upstream-sync --state open --json number -q '.[0].number')
+          if [ -n "$existing" ]; then
+            # One comment per upstream commit, not one per run.
+            if ! gh issue view "$existing" --comments | grep -q "$TARGET"; then
+              gh issue comment "$existing" --body "$body"
+            fi
+          else
+            gh label create upstream-sync --force >/dev/null
+            gh issue create --title "Upstream sync needs attention" --label upstream-sync --body "$body"
+          fi
