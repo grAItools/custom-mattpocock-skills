@@ -458,7 +458,7 @@ jobs:
             fail "the token cannot read $repo: $(tail -n 1 <<< "$head")"
             exit 1
           fi
-          expiry=$(grep -i '^github-authentication-token-expiration:' <<< "$head" | cut -d: -f2- | xargs || true)
+          expiry=$(grep -i '^github-authentication-token-expiration:' <<< "$head" | cut -d: -f2- | tr -d '\r' | xargs || true)
           if [ -z "$expiry" ]; then
             note "the token reports no expiry date"
           else
