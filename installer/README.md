@@ -74,26 +74,28 @@ When paths change and artifacts already exist at the previous ones, `apply` stop
 
 ## Upstream sync
 
-`.github/workflows/upstream-sync.yml` runs every 6 hours (and on demand from the Actions tab) and keeps `main` within a day of upstream `main`, which is what `npx skills add mattpocock/skills` installs:
+`.github/workflows/upstream-sync.yml` runs every 6 hours (and on demand from the Actions tab) and keeps `main` within a day of upstream `main`, which is what `npx skills add mattpocock/skills` installs. It has two jobs:
 
-1. It merges upstream `main` into an `upstream-sync` branch cut from `main` (a merge commit, never a rebase). A branch left open by an earlier blocked run is built on, so fixes pushed to it survive.
-2. On the merged tree it checks that the `release.yml` guard line is still there, then runs the tests, the guard and the real `npx skills` round trips.
-3. It pushes the branch, opens or updates one PR, and enables auto-merge only when every check passed and upstream did not touch `.github/`, `installer/` or `skills/fork/`.
-4. Anything else (a merge conflict, a failing check, a protected path changed) leaves the PR open without auto-merge, or unopened on a conflict, and comments once per upstream commit on a single issue labelled `upstream-sync`.
+- **check** has no write token. It merges upstream `main` into an `upstream-sync` branch cut from `main` (a merge commit, never a rebase; a branch left open by an earlier blocked run is built on, so fixes pushed to it survive), records the merge commit, and only then runs the checks on the merged tree: the `release.yml` guard line, the tests, the guard and the real `npx skills` round trips.
+- **publish** holds the GitHub App token and never executes anything from the tree. It pushes the recorded commit, after checking it is the one `check` recorded before the checks ran and that it contains the checked `main` and upstream commits. Then it opens or updates one PR and enables auto-merge, but only when every check passed and upstream's own changes do not touch `.github/`, `installer/` or `skills/fork/` (fixes people push to the sync branch are not counted).
 
-The token never reaches the checks: checkout does not store it, and only the push and `gh` steps see it.
+So upstream code runs only where there is no token to steal, and what lands is exactly what was checked.
+
+Everything else is reported on a single issue labelled `upstream-sync`, one comment per upstream commit and reason: a merge conflict (with upstream, or between `main` and the open sync branch), a failing check, a protected path changed, a PR that could not be merged, or a PR that has waited on auto-merge for over 12 hours. The issue is closed with a comment when a later sync goes through. A run that needs attention also ends red, so GitHub notifies you.
 
 ### One-time setup
 
-Until `SYNC_APP_ID` exists the job is skipped, so the workflow is harmless before this.
+Until `SYNC_APP_ID` exists both jobs are skipped, so the workflow is harmless before this.
 
 1. **Create a GitHub App** (Settings, Developer settings, GitHub Apps, New). No webhook. Repository permissions: *Contents*, *Pull requests*, *Issues* and *Workflows*, all read and write. Install it on this repository only.
 2. **Store its credentials** in this repository (Settings, Secrets and variables, Actions): the App ID as the variable `SYNC_APP_ID`, a generated private key as the secret `SYNC_APP_PRIVATE_KEY`.
 3. **Allow auto-merge**: Settings, General, Pull Requests, "Allow auto-merge".
-4. **Protect `main`** with a ruleset or branch protection that requires the status check "Tests and upstream-sync guard". Auto-merge then waits for it. Without protection the workflow merges at once, which is still safe: the same checks already passed on the exact tree.
+4. **Protect `main`** with a ruleset or branch protection that requires the status check "Tests and upstream-sync guard" (recommended). Auto-merge then waits for it. Do **not** require an approving review: the App cannot approve, so auto-merge would wait forever (the workflow reports that after 12 hours). Without protection the workflow merges at once, but only while `main` has not moved since the checks, so the merged tree is exactly the one checked; otherwise the next run retries.
 5. **Run it once by hand** (Actions, Upstream sync, Run workflow) and check the run: with nothing new upstream it reports "Up to date".
 
-GitHub may delay scheduled runs, and in a public repository disables scheduled workflows after 60 days without activity (it emails you; re-enable it from the Actions tab).
+GitHub may delay scheduled runs, and in a public repository disables scheduled workflows after 60 days without activity (it emails you; re-enable it from the Actions tab). If the App token cannot be created (wrong ID or key), the run fails before it can open an issue: the red run is the only signal.
+
+To drop a sync PR, close it **and delete the `upstream-sync` branch**; otherwise the next run builds on the branch and reopens it. The workflow always proposes the latest upstream `main`: to hold upstream back for a while, disable the workflow from the Actions tab.
 
 ### By hand
 
