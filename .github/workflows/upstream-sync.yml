@@ -509,8 +509,12 @@ jobs:
           fi
 
           # Repository settings the sync relies on (readable with this token).
-          settings=$(gh api "repos/$repo" -q '[.allow_auto_merge, .allow_merge_commit, .delete_branch_on_merge] | map(tostring) | join(" ")')
-          read -r auto_merge merge_commit delete_branch <<< "$settings"
+          settings=$(gh api "repos/$repo" -q '[.allow_auto_merge, .allow_merge_commit, .delete_branch_on_merge, .has_issues] | map(tostring) | join(" ")')
+          read -r auto_merge merge_commit delete_branch has_issues <<< "$settings"
+          # Forks start with Issues off; creating a label still works then,
+          # but the sync's report issue cannot be opened.
+          if [ "$has_issues" = true ]; then pass "Issues are enabled"
+          else fail "Issues are disabled, so a blocked sync cannot be reported (Settings, General, Features)"; fi
           if [ "$auto_merge" = true ]; then pass "Allow auto-merge is on"
           else fail "Allow auto-merge is off (Settings, General)"; fi
           if [ "$merge_commit" != false ]; then pass "merge commits are allowed"
