@@ -34,16 +34,16 @@ Mention any copy whose state is `modified` or `broken` now, since step 4 will st
 
 ### 3. Save
 
-Run `node <skill folder>/scripts/configure.mjs set key=value ...` with the user's changes. It validates each value (relative paths only; glossary and context map must be `.md` files) and saves `.agents/skill-paths.json`. On an error, show it and ask for a corrected value. Skip this step when nothing changed.
+Run `node <skill folder>/scripts/configure.mjs set key=value ...` with the user's changes. It validates each value (relative paths only; glossary and context map must be `.md` files; no two keys may share a path; `.git/`, `node_modules/`, agent skill folders, `AGENTS.md` and `CLAUDE.md` are refused) and saves `.agents/skill-paths.json`. On an error, show it and ask for a corrected value. Skip this step when nothing changed.
 
 ### 4. Apply
 
-Run `node <skill folder>/scripts/configure.mjs apply`. It rewrites the installed skills, keeps the original text of each changed file under `.agents/skill-paths/originals/`, writes the `Artifact locations` table into `AGENTS.md`, adds an `@AGENTS.md` line to `CLAUDE.md` (so Claude Code reads it), and writes `.agents/skill-paths.lock.json`.
+Run `node <skill folder>/scripts/configure.mjs apply`. It rewrites the installed skills, keeps the original text of each changed file under `.agents/skill-paths/originals/`, writes the `Artifact locations` table into `AGENTS.md`, adds an `@AGENTS.md` line to `CLAUDE.md` so Claude Code reads it (skipped when `CLAUDE.md` is a symlink to `AGENTS.md`), and writes `.agents/skill-paths.lock.json`.
 
 It stops, changing nothing, in two cases. Show the user what it printed and ask:
 
-- **Existing artifacts at the old locations** (paths changed since the last apply): move them (`--migrate`, which uses `git mv` for tracked files and updates references in `AGENTS.md`, `CLAUDE.md`, the context map and the setup config) or leave them (`--skip-migration`)? Re-run `apply` with the chosen flag.
-- **A skill whose original text cannot be recovered** (edited by hand): reinstall it with the `npx skills add` command the message shows and re-run `apply`, or re-run with `--force` to take its current text as the original.
+- **Existing artifacts at the previous locations** (paths changed since the last apply; on the first apply, the previous locations are the upstream defaults, so a project that already has `CONTEXT.md` or `docs/adr/` lands here): move them (`--migrate`, which uses `git mv` for tracked files and updates references in `AGENTS.md`, `CLAUDE.md`, the context map and the setup config) or leave them (`--skip-migration`)? Re-run `apply` with the chosen flag. Lines starting `cannot migrate:` (a destination that already exists, a folder moved into itself, two moves that overlap) block `--migrate`: the user resolves them by hand or changes one path at a time. A moved teaching workspace is always moved by hand.
+- **A skill edited by hand**: reinstall it with `npx skills add <source> --skill <name> -y` and re-run `apply`, or re-run with `--force`. With `--force`, files the script had rewritten come back from their saved originals (their hand edits are dropped, and it names them); hand edits elsewhere are kept. A skill whose saved originals are missing must be reinstalled.
 
 ### 5. Finish
 
@@ -52,5 +52,5 @@ Tell the user:
 - Which paths are now in effect.
 - To commit `.agents/`, `.claude/` (if present), `AGENTS.md`, `CLAUDE.md` and `skills-lock.json` together.
 - `npx skills add` and `npx skills update` put the default paths back into the skills they touch: run `/configure-artifact-paths` again after either.
-- For CI: `node .agents/skills/configure-artifact-paths/scripts/configure.mjs check` fails whenever the installed skills do not match the configured paths.
+- For CI: `node <skill folder>/scripts/configure.mjs check`, with the folder written out (usually `.agents/skills/configure-artifact-paths`), fails whenever the installed skills do not match the configured paths.
 - If they have not configured their issue tracker yet, to run `/setup-matt-pocock-skills` next.

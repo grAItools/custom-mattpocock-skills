@@ -121,7 +121,25 @@ export function normalizePath(key, value) {
   if (spec.kind === "file" && !trimmed.endsWith(".md")) {
     throw new Error(`paths.${key} = ${JSON.stringify(value)}: must be a Markdown file ending in .md`);
   }
+  const reserved = reservedReason(trimmed);
+  if (reserved) {
+    throw new Error(`paths.${key} = ${JSON.stringify(value)}: ${reserved}`);
+  }
   return trimmed;
+}
+
+// Locations owned by git, package managers, the agents, or this skill.
+function reservedReason(path) {
+  const [first] = path.split("/");
+  if (first === ".git" || first === "node_modules") return `${first}/ is not a place for project documents`;
+  if (/^\.[^/]+\/skills(\/|$)/.test(path) || /^\.(posit\/assistant|tabnine\/agent)\/skills(\/|$)/.test(path)) {
+    return "agent skill folders are managed by `npx skills`";
+  }
+  if (path === ".agents/skill-paths" || path.startsWith(".agents/skill-paths/") || path.startsWith(".agents/skill-paths.")) {
+    return "reserved for /configure-artifact-paths itself";
+  }
+  if (["AGENTS.md", "CLAUDE.md", "skills-lock.json"].includes(path)) return "that file has another job";
+  return null;
 }
 
 // Returns a fully populated, normalized config. Throws with a readable
@@ -143,6 +161,15 @@ export function validateConfig(raw) {
   const paths = {};
   for (const key of Object.keys(PATH_KEYS)) {
     paths[key] = normalizePath(key, key in rawPaths ? rawPaths[key] : PATH_KEYS[key].default);
+  }
+  // Two artifacts sharing one location would overwrite or confuse each other.
+  const owner = new Map();
+  for (const [key, value] of Object.entries(paths)) {
+    if (value === null || value === ".") continue;
+    if (owner.has(value)) {
+      throw new Error(`paths.${owner.get(value)} and paths.${key} both point at ${JSON.stringify(value)}`);
+    }
+    owner.set(value, key);
   }
   return { paths };
 }

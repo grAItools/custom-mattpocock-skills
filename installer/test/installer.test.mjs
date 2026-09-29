@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -19,7 +19,8 @@ const renderOne = (name, rel, paths) =>
 
 // What `npx skills add <source>` leaves behind: canonical copies in
 // .agents/skills, Claude Code links (or copies), and skills-lock.json.
-function skillsAdd(root, names, { mode = "symlink", source = SOURCE } = {}) {
+// `copies` adds copy-mode installs for other agent folders.
+function skillsAdd(root, names, { mode = "symlink", source = SOURCE, copies = [] } = {}) {
   const lockPath = join(root, "skills-lock.json");
   const lock = existsSync(lockPath) ? JSON.parse(readFileSync(lockPath, "utf8")) : { version: 1, skills: {} };
   for (const name of names) {
@@ -32,6 +33,10 @@ function skillsAdd(root, names, { mode = "symlink", source = SOURCE } = {}) {
     mkdirSync(join(root, ".claude/skills"), { recursive: true });
     if (mode === "copy") cpSync(src, claude, { recursive: true });
     else symlinkSync(`../../.agents/skills/${name}`, claude, "dir");
+    for (const base of copies) {
+      rmSync(join(root, base, name), { recursive: true, force: true });
+      cpSync(src, join(root, base, name), { recursive: true });
+    }
     lock.skills[name] = { source, sourceType: "github", computedHash: folderHash(readSkill(src)) };
   }
   writeFileSync(lockPath, JSON.stringify(lock, null, 2));
@@ -74,6 +79,16 @@ test("config: rejects unsafe or malformed values", () => {
     { glossary: null },
     { nope: "x" },
     { adrDir: "has space" },
+    { localTrackerDir: ".git/issues" },
+    { localTrackerDir: "node_modules/x" },
+    { adrDir: ".agents/skills/x" },
+    { adrDir: ".claude/skills" },
+    { adrDir: ".tabnine/agent/skills/x" },
+    { adrDir: ".agents/skill-paths/originals" },
+    { glossary: "AGENTS.md" },
+    { glossary: "CLAUDE.md" },
+    { glossary: "docs/G.md", contextMap: "docs/G.md" },
+    { adrDir: "docs/x", localTrackerDir: "docs/x" },
   ]) {
     assert.throws(() => validateConfig({ paths }), undefined, JSON.stringify(paths));
   }
@@ -146,7 +161,7 @@ test("apply: rewrites installed skills in place and writes the project files", (
   assert.match(read(root, ".agents/skills/domain-modeling/ADR-FORMAT.md"), /docs\/architecture\/decisions\//);
   assert.match(read(root, ".claude/skills/domain-modeling/ADR-FORMAT.md"), /docs\/architecture\/decisions\//, "via the symlink");
   assert.equal(
-    read(root, ".agents/skill-paths/originals/domain-modeling/ADR-FORMAT.md.orig"),
+    read(root, ".agents/skill-paths/originals/.agents/skills/domain-modeling/ADR-FORMAT.md.orig"),
     readFileSync(join(ALL.get("domain-modeling"), "ADR-FORMAT.md"), "utf8"),
   );
   assert.match(read(root, `.agents/skills/${SELF}/scripts/lib/paths.mjs`), /default: "CONTEXT\.md"/, "never rewrites itself");
@@ -154,7 +169,7 @@ test("apply: rewrites installed skills in place and writes the project files", (
   assert.match(read(root, "AGENTS.md"), /\| `docs\/architecture\/decisions\/` \|/);
   assert.match(read(root, "AGENTS.md"), /\| `docs\/research\/` \|/);
   assert.doesNotMatch(read(root, "AGENTS.md"), /handoff/i);
-  assert.ok(JSON.parse(read(root, LOCK_FILE)).skills["domain-modeling"]);
+  assert.ok(JSON.parse(read(root, LOCK_FILE)).copies[".agents/skills/domain-modeling"]);
   assert.deepEqual(check(root), []);
   assert.ok(status(root).skills.every((s) => s.copies.every((c) => c.state === "configured")));
 
@@ -184,7 +199,7 @@ test("apply: reconfiguring starts from the original text, not the previous rende
       assert.equal(read(root, `.agents/skills/${name}/${f.rel}`), f.content.toString("utf8"), `${name}/${f.rel}`);
     }
   }
-  assert.ok(!existsSync(join(root, ".agents/skill-paths/originals/domain-modeling")));
+  assert.ok(!existsSync(join(root, ".agents/skill-paths/originals/.agents/skills/domain-modeling")));
 });
 
 test("apply: re-renders skills that npx skills update put back", () => {
@@ -286,4 +301,182 @@ test("apply --skip-migration: leaves artifacts in place", () => {
   apply(root, { log: quiet, skipMigration: true });
   assert.ok(existsSync(join(root, "CONTEXT.md")));
   assert.deepEqual(check(root), []);
+});
+
+// ---------------------------------------------------------------- review regressions
+
+test("hash: matches the computedHash npx skills 1.7.0 recorded for a fixture", () => {
+  // Pinned from `npx skills@1.7.0 add installer/test/fixtures/hash-skill`.
+  const fixture = new URL("./fixtures/hash-skill", import.meta.url).pathname;
+  assert.equal(folderHash(readSkill(fixture)), "796783aa8785fc3900f287b3cdc7c2dc5be8caa487525f22f4fbe23bc4229cd1");
+});
+
+test("first apply: artifacts at the upstream defaults count as the previous locations", () => {
+  const root = project();
+  writeFileSync(join(root, "CONTEXT.md"), "# Glossary\n");
+  mkdirSync(join(root, "docs/adr"), { recursive: true });
+  writeFileSync(join(root, "docs/adr/0001-x.md"), "# X\n");
+  mkdirSync(join(root, "docs/agents"), { recursive: true });
+  writeFileSync(join(root, "docs/agents/issue-tracker.md"), "# Tracker\n");
+  writeFileSync(join(root, "CLAUDE.md"), "## Agent skills\n\nSee `docs/agents/issue-tracker.md`.\n");
+  setPaths(root, ["glossary=GLOSSARY.md", "adrDir=decisions", "skillsConfigDir=agent-config"]);
+
+  assert.throws(() => apply(root, { log: quiet }), /--migrate/);
+  assert.ok(!existsSync(join(root, LOCK_FILE)), "nothing applied");
+  apply(root, { log: quiet, migrate: true });
+  assert.ok(existsSync(join(root, "GLOSSARY.md")));
+  assert.ok(existsSync(join(root, "decisions/0001-x.md")));
+  assert.ok(existsSync(join(root, "agent-config/issue-tracker.md")));
+  assert.match(read(root, "CLAUDE.md"), /See `agent-config\/issue-tracker\.md`/);
+  assert.deepEqual(check(root), []);
+});
+
+test("--force on a configured skill starts from the saved originals", () => {
+  const root = project();
+  skillsAdd(root, ["teach"]);
+  setPaths(root, ["adrDir=adr", "teachDir=learn"]);
+  apply(root, { log: quiet });
+  const skillPath = join(root, ".agents/skills/domain-modeling/SKILL.md");
+  writeFileSync(skillPath, `${readFileSync(skillPath, "utf8")}\nHand edit.\n`);
+  writeFileSync(join(root, ".agents/skills/teach/NOTES.md"), "hand-added file\n");
+  assert.throws(() => apply(root, { log: quiet }), /pass --force/);
+
+  const logs = [];
+  apply(root, { log: (m) => logs.push(m), force: true, skipMigration: true });
+  assert.ok(logs.some((l) => l.includes("--force drops edits to .agents/skills/domain-modeling/SKILL.md")));
+  setPaths(root, ["adrDir=architecture/decisions", "teachDir=learning"]);
+  apply(root, { log: quiet, skipMigration: true });
+  assert.match(read(root, ".agents/skills/domain-modeling/SKILL.md"), /architecture\/decisions\//);
+  const mission = read(root, ".agents/skills/teach/MISSION-FORMAT.md");
+  assert.equal(mission.match(/relative to the teaching workspace/g).length, 1);
+  assert.match(mission, /`learning\/`/);
+  assert.equal(read(root, ".agents/skills/teach/NOTES.md"), "hand-added file\n", "edits outside rendered files survive");
+  assert.deepEqual(check(root), []);
+});
+
+test("--force cannot recover a configured skill whose originals are gone", () => {
+  const root = project();
+  setPaths(root, ["adrDir=adr"]);
+  apply(root, { log: quiet });
+  rmSync(join(root, ".agents/skill-paths/originals/.agents/skills/domain-modeling"), { recursive: true });
+  writeFileSync(join(root, ".agents/skills/domain-modeling/extra.md"), "x");
+  assert.throws(() => apply(root, { log: quiet, force: true }), /saved originals .* missing/);
+});
+
+test("CLAUDE.md symlinked to AGENTS.md gets the block once and no self-import", () => {
+  const root = project();
+  writeFileSync(join(root, "AGENTS.md"), "# Project\n");
+  symlinkSync("AGENTS.md", join(root, "CLAUDE.md"));
+  apply(root, { log: quiet });
+  const text = read(root, "AGENTS.md");
+  assert.match(text, /## Artifact locations/);
+  assert.doesNotMatch(text, /@AGENTS\.md/);
+  assert.ok(lstatSync(join(root, "CLAUDE.md")).isSymbolicLink());
+  assert.deepEqual(check(root), []);
+});
+
+test("migration problems stop apply without --migrate", () => {
+  const root = project();
+  skillsAdd(root, ["teach"]);
+  apply(root, { log: quiet });
+  writeFileSync(join(root, "MISSION.md"), "# Mission\n");
+  setPaths(root, ["teachDir=learning"]);
+  assert.throws(() => apply(root, { log: quiet }), /teaching workspace .* by hand/);
+  apply(root, { log: quiet, skipMigration: true });
+
+  mkdirSync(join(root, "docs/adr"), { recursive: true });
+  mkdirSync(join(root, "decisions"), { recursive: true });
+  setPaths(root, ["adrDir=decisions"]);
+  assert.throws(() => apply(root, { log: quiet }), /destination already exists/);
+  assert.throws(() => apply(root, { log: quiet, migrate: true }), /destination already exists/);
+});
+
+test("migration refuses nested or overlapping moves before moving anything", () => {
+  const root = project();
+  apply(root, { log: quiet });
+  mkdirSync(join(root, ".scratch/feature"), { recursive: true });
+  mkdirSync(join(root, "docs/adr"), { recursive: true });
+  setPaths(root, ["localTrackerDir=.scratch/tracker", "adrDir=decisions"]);
+  assert.throws(() => apply(root, { log: quiet, migrate: true }), /into itself/);
+  assert.ok(existsSync(join(root, "docs/adr")), "the valid move did not run either");
+
+  setPaths(root, ["localTrackerDir=default", "adrDir=docs/adr/archive", "glossary=docs/adr/archive/G.md"]);
+  writeFileSync(join(root, "CONTEXT.md"), "# G\n");
+  assert.throws(() => apply(root, { log: quiet, migrate: true }), /into itself|overlaps/);
+});
+
+test("migration rewrites references in one pass", () => {
+  const root = project();
+  apply(root, { log: quiet });
+  writeFileSync(join(root, "CLAUDE.md"), `${read(root, "CLAUDE.md")}\nGlossary: \`CONTEXT.md\`.\n`);
+  setPaths(root, ["glossary=docs/agents/GLOSSARY.md", "skillsConfigDir=config/agents"]);
+  apply(root, { log: quiet, migrate: true });
+  assert.match(read(root, "CLAUDE.md"), /Glossary: `docs\/agents\/GLOSSARY\.md`/);
+});
+
+test("dry-run migration lists a context map that moves", () => {
+  const root = project();
+  apply(root, { log: quiet });
+  writeFileSync(join(root, "CONTEXT-MAP.md"), "- [Ordering](./src/ordering/CONTEXT.md)\n");
+  setPaths(root, ["contextMap=domain/MAP.md", "glossary=GLOSSARY.md"]);
+  const logs = [];
+  apply(root, { log: (m) => logs.push(m), migrate: true, dryRun: true });
+  assert.ok(logs.some((l) => l.includes("update path references in CONTEXT-MAP.md")), logs.join("\n"));
+  apply(root, { log: quiet, migrate: true });
+  assert.equal(read(root, "domain/MAP.md"), "- [Ordering](./src/ordering/GLOSSARY.md)\n");
+});
+
+test("copies in nested agent folders are rendered; a project's own skills/ folder is not", () => {
+  const root = project({ copies: [".tabnine/agent/skills"] });
+  mkdirSync(join(root, "skills/to-tickets"), { recursive: true });
+  writeFileSync(join(root, "skills/to-tickets/SKILL.md"), "Project doc about `.scratch/`.\n");
+  setPaths(root, ["localTrackerDir=work"]);
+  apply(root, { log: quiet });
+  assert.match(read(root, ".tabnine/agent/skills/to-tickets/SKILL.md"), /`work\/<feature-slug>/);
+  assert.equal(read(root, "skills/to-tickets/SKILL.md"), "Project doc about `.scratch/`.\n");
+  assert.deepEqual(check(root), []);
+});
+
+test("each copy is tracked on its own", () => {
+  const root = project({ mode: "copy" });
+  setPaths(root, ["localTrackerDir=work"]);
+  apply(root, { log: quiet });
+  // `npx skills` refreshes only the shared copy; the Claude copy stays rendered.
+  cpSync(ALL.get("to-tickets"), join(root, ".agents/skills/to-tickets"), { recursive: true });
+  assert.deepEqual(
+    status(root).skills.find((s) => s.name === "to-tickets").copies.map((c) => c.state).sort(),
+    ["configured", "original"],
+  );
+  apply(root, { log: quiet });
+  assert.deepEqual(check(root), []);
+});
+
+test("re-apply with nothing to do writes and reports nothing", () => {
+  const root = project();
+  setPaths(root, ["localTrackerDir=work"]);
+  apply(root, { log: quiet });
+  const logs = [];
+  apply(root, { log: (m) => logs.push(m) });
+  assert.deepEqual(logs, []);
+});
+
+test("guard: flags a rule that stops matching in one of its files", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "guard-"));
+  cpSync(ALL.get("teach"), tmp, { recursive: true });
+  const file = join(tmp, "MISSION-FORMAT.md");
+  writeFileSync(file, readFileSync(file, "utf8").replace(/^# .*\n/m, ""));
+  const { unmatched } = runGuard(new Map([...ALL, ["teach", tmp]]));
+  assert.deepEqual(unmatched, ["teach-format-note in teach/MISSION-FORMAT.md"]);
+});
+
+test("cli: status, set, apply and check run end to end", () => {
+  const root = project();
+  const cli = join(SELF_DIR, "scripts/configure.mjs");
+  const run = (...args) => execFileSync("node", [cli, ...args, "--project", root], { encoding: "utf8" });
+  assert.equal(JSON.parse(run("status")).paths.adrDir.default, "docs/adr");
+  run("set", "adrDir=decisions");
+  assert.match(run("apply"), /applied the paths to \d+ installed skill copies/);
+  assert.match(run("check"), /match the configured paths/);
+  writeFileSync(join(root, ".agents/skills/tdd/SKILL.md"), "edited");
+  assert.throws(() => run("check"), (err) => err.status === 1 && /edited by hand/.test(err.stderr));
 });

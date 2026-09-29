@@ -1,11 +1,11 @@
 // Applies a project's artifact paths to the skills `npx skills add` installed
 // from this repo, in place.
 //
-// `npx skills` copies skills verbatim and re-copies them on update, so the
-// installed text is either:
+// `npx skills` copies skills verbatim and re-copies them on update, so each
+// installed copy is either:
 //   - original: matches the hash `npx skills` recorded in skills-lock.json
 //     (fresh install or update), or
-//   - rendered by us: matches the hash in our lock file. The original is then
+//   - configured: matches the hash in our lock file. The original is then
 //     the installed text with the changed files swapped for the copies we
 //     kept in ORIGINALS_DIR.
 // Anything else was edited by hand and is left alone unless forced.
@@ -18,6 +18,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -31,12 +32,21 @@ export const SKILLS_LOCK = "skills-lock.json";
 const BLOCK_START = "<!-- mattpocock-skills:paths:start -->";
 const BLOCK_END = "<!-- mattpocock-skills:paths:end -->";
 const IMPORT_LINE = "@AGENTS.md";
-const MIGRATION_SKIP_DIRS = new Set([".git", "node_modules", ".agents", ".claude", "vendor"]);
 const ORIG_SUFFIX = ".orig";
+
+// Project-level skill folders `npx skills` writes to (skills 1.7.0 agent
+// table). Hidden top-level `.<agent>/skills/` folders are found generically;
+// these are the others. A copy in a non-hidden folder is only managed when
+// its hash is recognised, so a project's own `skills/` folder is never
+// mistaken for an install.
+const NESTED_SKILL_BASES = [".posit/assistant/skills", ".tabnine/agent/skills"];
+const PLAIN_SKILL_BASES = ["skills", "agent/skills", "data/skills"];
 
 const readJson = (file) => JSON.parse(readFileSync(file, "utf8"));
 const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const rel = (root, p) => relative(root, p).split(sep).join("/");
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const isInside = (child, parent) => child !== parent && child.startsWith(`${parent}${sep}`);
 
 function exists(path) {
   try {
@@ -74,7 +84,7 @@ function readSkillDir(dir) {
       if (entry.isDirectory()) {
         if (entry.name !== ".git" && entry.name !== "node_modules") walk(full);
       } else if (entry.isFile()) {
-        files.push({ rel: rel(dir, full), content: readFileSync(full), mode: lstatSync(full).mode & 0o777 });
+        files.push({ rel: rel(dir, full), content: readFileSync(full) });
       }
     }
   };
@@ -133,7 +143,9 @@ export function setPaths(root, assignments) {
 
 export function loadLock(root) {
   const file = join(root, LOCK_FILE);
-  return existsSync(file) ? readJson(file) : null;
+  if (!existsSync(file)) return null;
+  const lock = readJson(file);
+  return lock.copies ? lock : null;
 }
 
 // ---------------------------------------------------------------- discovery
@@ -156,50 +168,84 @@ export function managedSkills(root) {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-// Real (non-symlink) folders holding an installed copy of `name`: the shared
-// `.agents/skills/<name>`, plus agent folders when installed in copy mode.
-// Symlinked agent folders point at the shared copy and need no work.
-export function skillCopies(root, name) {
-  const bases = new Set([".agents"]);
+// Real (non-symlink) folders that may hold an installed copy of `name`: the
+// shared `.agents/skills/<name>`, plus agent folders when installed in copy
+// mode. Symlinked agent folders point at the shared copy and need no work.
+function candidateCopies(root, name) {
+  const bases = new Set([".agents/skills", ...NESTED_SKILL_BASES]);
   for (const entry of readdirSync(root, { withFileTypes: true })) {
-    // Agent folders are hidden top-level folders (`.claude`, `.pi`, ...).
-    if (entry.isDirectory() && entry.name.startsWith(".") && entry.name !== ".git") bases.add(entry.name);
+    if (entry.isDirectory() && entry.name.startsWith(".") && entry.name !== ".git") bases.add(`${entry.name}/skills`);
   }
-  const copies = [];
-  for (const base of bases) {
-    const dir = join(root, base, "skills", name);
-    if (isKind(dir, "dir") && existsSync(join(dir, "SKILL.md"))) copies.push(dir);
+  const found = [];
+  for (const [list, plain] of [[bases, false], [PLAIN_SKILL_BASES, true]]) {
+    for (const base of list) {
+      const dir = join(root, ...base.split("/"), name);
+      if (isKind(dir, "dir") && existsSync(join(dir, "SKILL.md"))) found.push({ dir, plain });
+    }
   }
-  return copies;
+  return found;
 }
 
-function originalsFor(root, name, current, entry) {
-  const dir = join(root, ORIGINALS_DIR, name);
+function originalsDir(root, key) {
+  return join(root, ORIGINALS_DIR, ...key.split("/"));
+}
+
+// The installed files with every file we changed swapped back for its saved
+// original, or null when a saved original is missing.
+function withOriginals(root, key, current, entry) {
+  const dir = originalsDir(root, key);
   const byRel = new Map(current.map((f) => [f.rel, f]));
   for (const r of entry.changed) {
-    const saved = join(dir, r + ORIG_SUFFIX);
+    const saved = join(dir, ...(r + ORIG_SUFFIX).split("/"));
     if (!existsSync(saved)) return null;
-    byRel.set(r, { ...byRel.get(r), rel: r, content: readFileSync(saved) });
+    byRel.set(r, { rel: r, content: readFileSync(saved) });
   }
-  return [...byRel.values()];
+  return [...byRel.values()].sort((a, b) => a.rel.localeCompare(b.rel));
 }
 
 // Classifies one installed copy and recovers its original files.
+//   configured: rendered by us and untouched since.
+//   original:   straight from `npx skills`.
+//   modified:   edited after install or render. `rebuilt` is the best
+//               reconstruction: our saved originals for the files we
+//               changed, the current text for everything else.
+//   broken:     rendered by us, but saved originals are missing or edited.
 export function inspectCopy(root, skill, dir, lock) {
+  const key = rel(root, dir);
   const current = readSkillDir(dir);
   const hash = folderHash(current);
-  const entry = lock?.skills?.[skill.name];
+  const entry = lock?.copies?.[key];
   if (entry && hash === entry.renderedHash) {
-    const original = originalsFor(root, skill.name, current, entry);
+    const original = withOriginals(root, key, current, entry);
     if (original && folderHash(original) === entry.originalHash) {
-      return { state: "configured", current, original };
+      return { key, state: "configured", current, original };
     }
-    return { state: "broken", current, original: null };
+    return { key, state: "broken", current, original: null };
   }
   if (skill.computedHash && hash === skill.computedHash) {
-    return { state: "original", current, original: current };
+    return { key, state: "original", current, original: current };
   }
-  return { state: "modified", current, original: null };
+  if (entry) {
+    const rebuilt = withOriginals(root, key, current, entry);
+    return rebuilt
+      ? { key, state: "modified", current, original: null, rebuilt, entry }
+      : { key, state: "broken", current, original: null };
+  }
+  return { key, state: "modified", current, original: null, rebuilt: current };
+}
+
+// Installed copies of the managed skills with their state.
+function inspectAll(root, skills, lock) {
+  const copies = [];
+  const missing = [];
+  for (const skill of skills) {
+    const found = candidateCopies(root, skill.name)
+      .map(({ dir, plain }) => ({ plain, ...inspectCopy(root, skill, dir, lock), skill, dir }))
+      .filter((c) => !c.plain || c.state === "configured" || c.state === "original" || lock?.copies?.[c.key]);
+    if (!found.length) missing.push(skill.name);
+    copies.push(...found);
+  }
+  return { copies, missing };
 }
 
 // ---------------------------------------------------------------- AGENTS.md
@@ -239,9 +285,25 @@ function upsertBlock(text, block) {
 
 const hasImport = (text) => text.split(/\r?\n/).some((line) => line.trim() === IMPORT_LINE);
 
+function realpathOrNull(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    return null;
+  }
+}
+
+// AGENTS.md gets the generated block; CLAUDE.md gets an `@AGENTS.md` import
+// so Claude Code reads it too. When one is a symlink to the other there is a
+// single file: it gets the block and no (self-)import.
 export function instructionFiles(root, paths) {
   const agentsPath = join(root, "AGENTS.md");
   const claudePath = join(root, "CLAUDE.md");
+  const agentsReal = realpathOrNull(agentsPath);
+  if (agentsReal && agentsReal === realpathOrNull(claudePath)) {
+    const text = readFileSync(agentsPath, "utf8");
+    return [{ path: agentsPath, before: text, after: upsertBlock(text, managedBlock(paths)) }];
+  }
   const agents = existsSync(agentsPath) ? readFileSync(agentsPath, "utf8") : "";
   const claude = existsSync(claudePath) ? readFileSync(claudePath, "utf8") : "";
   const nextClaude = hasImport(claude)
@@ -257,18 +319,23 @@ export function instructionFiles(root, paths) {
 
 // ---------------------------------------------------------------- migration
 
+// Context roots: every folder except hidden ones and dependencies.
 function walkDirs(dir, out) {
   out.push(dir);
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (entry.isDirectory() && !MIGRATION_SKIP_DIRS.has(entry.name)) walkDirs(join(dir, entry.name), out);
+    if (entry.isDirectory() && !entry.name.startsWith(".") && entry.name !== "node_modules" && entry.name !== "vendor") {
+      walkDirs(join(dir, entry.name), out);
+    }
   }
   return out;
 }
 
 // Moves needed to bring existing artifacts from `oldPaths` to `newPaths`.
+// `problems` block a migration; `manual` are left for the user to move.
 export function planMigration(root, oldPaths, newPaths) {
   const moves = [];
   const problems = [];
+  const manual = [];
   const contextRoots = walkDirs(root, []);
   for (const [key, spec] of Object.entries(PATH_KEYS)) {
     const from = oldPaths[key];
@@ -276,7 +343,7 @@ export function planMigration(root, oldPaths, newPaths) {
     if (from === to || from === null || to === null) continue;
     if (key === "teachDir") {
       if (existsSync(join(root, from === "." ? "MISSION.md" : from))) {
-        problems.push(`teachDir changed (${from} -> ${to}): move the teaching workspace by hand`);
+        manual.push(`the teaching workspace (${from === "." ? "the repo root" : `${from}/`} -> ${to === "." ? "the repo root" : `${to}/`})`);
       }
       continue;
     }
@@ -284,38 +351,70 @@ export function planMigration(root, oldPaths, newPaths) {
       const src = join(base, from);
       if (!isKind(src, spec.kind)) continue;
       const dest = join(base, to);
-      if (exists(dest)) {
+      if (isInside(dest, src)) {
+        problems.push(`${rel(root, src)} -> ${rel(root, dest)}: cannot move a folder into itself; move it by hand`);
+      } else if (exists(dest)) {
         problems.push(`${rel(root, src)} -> ${rel(root, dest)}: destination already exists`);
-        continue;
+      } else {
+        moves.push({ src, dest });
       }
-      moves.push({ src, dest });
     }
   }
-  return { moves, problems };
+  // Every move must stand on its own: no shared destinations and no move
+  // inside another one's source or destination.
+  for (const a of moves) {
+    for (const b of moves) {
+      if (a === b) continue;
+      const clash =
+        a.dest === b.dest || isInside(a.src, b.src) || isInside(a.dest, b.src) || isInside(a.src, b.dest) || isInside(a.dest, b.dest);
+      if (clash && moves.indexOf(a) < moves.indexOf(b)) {
+        problems.push(
+          `${rel(root, a.src)} -> ${rel(root, a.dest)} overlaps ${rel(root, b.src)} -> ${rel(root, b.dest)}: change one path at a time`,
+        );
+      }
+    }
+  }
+  return { moves, problems, manual };
 }
 
-function pathTokenRegex(value) {
-  const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?<![\\w.-])${escaped}(?![\\w-])`, "g");
+// Replaces every old path with its new one in a single pass, so a new value
+// is never rewritten again by a later key.
+function referenceRewriter(oldPaths, newPaths) {
+  const map = new Map();
+  for (const k of Object.keys(PATH_KEYS)) {
+    if (k === "teachDir" || oldPaths[k] === newPaths[k] || oldPaths[k] === null || newPaths[k] === null) continue;
+    map.set(oldPaths[k], newPaths[k]);
+  }
+  if (!map.size) return null;
+  const alternation = [...map.keys()].sort((a, b) => b.length - a.length).map(escapeRe).join("|");
+  const re = new RegExp(`(?<![\\w.-])(${alternation})(?![\\w-])`, "g");
+  return (text) => text.replace(re, (m) => map.get(m));
 }
 
 // References to moved paths in the files known to hold them: the
-// instruction files, the context map, and the config written by
-// /setup-matt-pocock-skills.
+// instruction files, the context map (at its old or new location), and the
+// config written by /setup-matt-pocock-skills.
 export function planReferenceRewrites(root, oldPaths, newPaths) {
-  const candidates = [join(root, "AGENTS.md"), join(root, "CLAUDE.md"), join(root, newPaths.contextMap)];
-  for (const dir of [join(root, newPaths.skillsConfigDir), join(root, oldPaths.skillsConfigDir)]) {
+  const rewrite = referenceRewriter(oldPaths, newPaths);
+  if (!rewrite) return [];
+  const candidates = [
+    join(root, "AGENTS.md"),
+    join(root, "CLAUDE.md"),
+    join(root, oldPaths.contextMap),
+    join(root, newPaths.contextMap),
+  ];
+  for (const dir of [join(root, oldPaths.skillsConfigDir), join(root, newPaths.skillsConfigDir)]) {
     if (isKind(dir, "dir")) {
       for (const f of readdirSync(dir)) if (f.endsWith(".md")) candidates.push(join(dir, f));
     }
   }
-  const changed = Object.keys(PATH_KEYS).filter(
-    (k) => k !== "teachDir" && oldPaths[k] !== newPaths[k] && oldPaths[k] !== null && newPaths[k] !== null,
-  );
   const rewrites = [];
-  for (const file of new Set(candidates)) {
-    if (!isKind(file, "file")) continue;
-    const before = readFileSync(file, "utf8");
+  const seen = new Set();
+  for (const file of candidates) {
+    const real = realpathOrNull(file);
+    if (!real || seen.has(real) || !isKind(real, "file")) continue;
+    seen.add(real);
+    const before = readFileSync(real, "utf8");
     // The generated block is rebuilt from the config anyway: leave it out.
     const start = before.indexOf(BLOCK_START);
     const end = before.indexOf(BLOCK_END);
@@ -323,7 +422,6 @@ export function planReferenceRewrites(root, oldPaths, newPaths) {
       start !== -1 && end > start
         ? [before.slice(0, start), before.slice(start, end), before.slice(end)]
         : [before, "", ""];
-    const rewrite = (text) => changed.reduce((t, key) => t.replace(pathTokenRegex(oldPaths[key]), newPaths[key]), text);
     const after = rewrite(head) + block + rewrite(tail);
     if (after !== before) rewrites.push({ file, after });
   }
@@ -345,13 +443,8 @@ function moveArtifact(root, src, dest) {
 export function status(root) {
   const { exists: configExists, config } = loadConfig(root);
   const lock = loadLock(root);
-  const skills = managedSkills(root).map((skill) => {
-    const copies = skillCopies(root, skill.name).map((dir) => ({
-      dir: rel(root, dir),
-      state: inspectCopy(root, skill, dir, lock).state,
-    }));
-    return { name: skill.name, copies };
-  });
+  const skills = managedSkills(root);
+  const { copies } = inspectAll(root, skills, lock);
   const defaults = defaultPaths();
   return {
     configFile: CONFIG_FILE,
@@ -369,7 +462,10 @@ export function status(root) {
         },
       ]),
     ),
-    skills,
+    skills: skills.map(({ name }) => ({
+      name,
+      copies: copies.filter((c) => c.skill.name === name).map((c) => ({ dir: c.key, state: c.state })),
+    })),
   };
 }
 
@@ -385,93 +481,116 @@ export function apply(root, opts = {}) {
   const { exists: configExists, config } = loadConfig(root);
   const lock = loadLock(root);
   const skills = managedSkills(root);
+  const { copies, missing } = inspectAll(root, skills, lock);
+  for (const name of missing) log(`skip ${name}: listed in ${SKILLS_LOCK} but not installed`);
 
   // Recover every copy's original text before touching anything.
-  const work = [];
   const blocked = [];
-  for (const skill of skills) {
-    const copies = skillCopies(root, skill.name);
-    if (!copies.length) {
-      log(`skip ${skill.name}: listed in ${SKILLS_LOCK} but not installed`);
-      continue;
-    }
-    for (const dir of copies) {
-      const info = inspectCopy(root, skill, dir, lock);
-      if (!info.original) {
-        if (!force) {
-          blocked.push(`${rel(root, dir)} (${info.state === "broken" ? `missing originals under ${ORIGINALS_DIR}` : "edited since it was installed"})`);
-          continue;
-        }
-        info.original = info.current;
+  for (const c of copies) {
+    if (c.original) continue;
+    if (c.state === "broken") {
+      blocked.push(`${c.key}: its saved originals under ${ORIGINALS_DIR} are missing or edited; reinstall it`);
+    } else if (!force) {
+      blocked.push(`${c.key}: edited since it was installed; reinstall it, or pass --force`);
+    } else {
+      // Files we rendered come back from their saved originals, so hand
+      // edits to them are lost: say which.
+      if (c.entry) {
+        const lost = c.entry.changed.filter((r) => {
+          const now = c.current.find((f) => f.rel === r);
+          const orig = c.rebuilt.find((f) => f.rel === r);
+          const expected = renderFiles(c.skill.name, [orig], lock.config.paths).files[0];
+          return !now || !now.content.equals(expected.content);
+        });
+        if (lost.length) log(`warning: --force drops edits to ${lost.map((r) => `${c.key}/${r}`).join(", ")}`);
       }
-      work.push({ skill, dir, ...info });
+      c.original = c.rebuilt;
     }
   }
   if (blocked.length) {
     throw new Error(
-      `cannot recover the original text of:\n  ${blocked.join("\n  ")}\nreinstall them with \`npx skills add <source> --skill <name> -y\`, or pass --force to treat their current text as the original`,
+      `cannot recover the original text of:\n  ${blocked.join("\n  ")}\nreinstall with \`npx skills add <source> --skill <name> -y\`, then re-run apply`,
     );
   }
 
-  // Artifacts at the previously applied locations.
-  const oldPaths = lock?.config?.paths;
-  if (oldPaths && !sameJson(oldPaths, config.paths)) {
-    const { moves, problems } = planMigration(root, oldPaths, config.paths);
+  // Artifacts at the previously applied locations. Before the first apply the
+  // skills used the upstream defaults, so those are the previous locations.
+  const oldPaths = lock?.config?.paths ?? defaultPaths();
+  if (!sameJson(oldPaths, config.paths)) {
+    const { moves, problems, manual } = planMigration(root, oldPaths, config.paths);
     const rewrites = planReferenceRewrites(root, oldPaths, config.paths);
     if (migrate) {
       if (problems.length) throw new Error(`cannot migrate:\n  ${problems.join("\n  ")}`);
-      for (const m of moves) {
-        act(`move ${rel(root, m.src)} -> ${rel(root, m.dest)}`, () => moveArtifact(root, m.src, m.dest));
+      const done = [];
+      try {
+        for (const m of moves) {
+          act(`move ${rel(root, m.src)} -> ${rel(root, m.dest)}`, () => moveArtifact(root, m.src, m.dest));
+          done.push(m);
+        }
+      } catch (err) {
+        const moved = done.map((m) => `${rel(root, m.src)} -> ${rel(root, m.dest)}`);
+        throw new Error(
+          `migration stopped: ${err.message}\nalready moved:\n  ${moved.join("\n  ") || "(nothing)"}\nmove those back, or finish by hand and re-run with --skip-migration`,
+        );
       }
       const final = dryRun ? rewrites : planReferenceRewrites(root, oldPaths, config.paths);
       for (const r of final) {
         act(`update path references in ${rel(root, r.file)}`, () => writeFileSync(r.file, r.after));
       }
-    } else if ((moves.length || rewrites.length) && !skipMigration) {
+      for (const m of manual) log(`warning: move ${m} by hand`);
+    } else if (!skipMigration && (moves.length || rewrites.length || problems.length || manual.length)) {
       const lines = [
-        ...moves.map((m) => `${rel(root, m.src)} -> ${rel(root, m.dest)}`),
-        ...rewrites.map((r) => `references in ${rel(root, r.file)}`),
+        ...moves.map((m) => `move ${rel(root, m.src)} -> ${rel(root, m.dest)}`),
+        ...rewrites.map((r) => `update references in ${rel(root, r.file)}`),
+        ...manual.map((m) => `move ${m} by hand`),
+        ...problems.map((p) => `cannot migrate: ${p}`),
       ];
       throw new Error(
-        `paths changed since they were last applied, and existing artifacts still use the old locations:\n  ${lines.join("\n  ")}\nre-run with --migrate to move them, or --skip-migration to leave them where they are`,
+        `paths changed, and existing artifacts still use the previous locations:\n  ${lines.join("\n  ")}\nre-run with --migrate to move them, or --skip-migration to leave them where they are`,
       );
     }
   }
 
   if (!configExists) act(`write ${CONFIG_FILE}`, () => writeConfig(root, config));
 
-  const lockSkills = {};
-  for (const { skill, dir, current, original } of work) {
-    const { files: rendered } = renderFiles(skill.name, original, config.paths);
-    const byRel = new Map(original.map((f) => [f.rel, f.content]));
+  const lockCopies = {};
+  for (const c of copies) {
+    const { files: rendered } = renderFiles(c.skill.name, c.original, config.paths);
+    const byRel = new Map(c.original.map((f) => [f.rel, f.content]));
     const changed = rendered.filter((f) => !f.content.equals(byRel.get(f.rel))).map((f) => f.rel);
-    const currentByRel = new Map(current.map((f) => [f.rel, f.content]));
+    const currentByRel = new Map(c.current.map((f) => [f.rel, f.content]));
     const toWrite = rendered.filter((f) => !f.content.equals(currentByRel.get(f.rel)));
     if (toWrite.length) {
-      act(`render ${rel(root, dir)} (${toWrite.length} file${toWrite.length === 1 ? "" : "s"})`, () => {
-        for (const f of toWrite) writeFileSync(join(dir, ...f.rel.split("/")), f.content);
+      act(`render ${c.key} (${toWrite.length} file${toWrite.length === 1 ? "" : "s"})`, () => {
+        for (const f of toWrite) writeFileSync(join(c.dir, ...f.rel.split("/")), f.content);
       });
     }
-    lockSkills[skill.name] = {
-      originalHash: folderHash(original),
+    lockCopies[c.key] = {
+      skill: c.skill.name,
+      originalHash: folderHash(c.original),
       renderedHash: folderHash(rendered),
       changed,
     };
-    const origDir = join(root, ORIGINALS_DIR, skill.name);
-    act(`keep originals of ${skill.name} (${changed.length})`, () => {
-      rmSync(origDir, { recursive: true, force: true });
-      for (const r of changed) {
-        const out = join(origDir, ...(r + ORIG_SUFFIX).split("/"));
-        mkdirSync(dirname(out), { recursive: true });
-        writeFileSync(out, byRel.get(r));
-      }
-    });
+    // Rewrite the saved originals only when they differ from what is there.
+    const origDir = originalsDir(root, c.key);
+    const saved = existsSync(origDir) ? readSkillDir(origDir) : [];
+    const wanted = changed.map((r) => ({ rel: r + ORIG_SUFFIX, content: byRel.get(r) }));
+    if (folderHash(saved) !== folderHash(wanted) || saved.length !== wanted.length) {
+      act(`save originals of ${c.key} (${changed.length} file${changed.length === 1 ? "" : "s"})`, () => {
+        rmSync(origDir, { recursive: true, force: true });
+        for (const w of wanted) {
+          const out = join(origDir, ...w.rel.split("/"));
+          mkdirSync(dirname(out), { recursive: true });
+          writeFileSync(out, w.content);
+        }
+      });
+    }
   }
 
-  // Forget skills that were removed with `npx skills remove`.
-  for (const name of Object.keys(lock?.skills ?? {})) {
-    if (!lockSkills[name]) {
-      act(`forget ${name}`, () => rmSync(join(root, ORIGINALS_DIR, name), { recursive: true, force: true }));
+  // Forget copies that are gone (e.g. `npx skills remove`).
+  for (const key of Object.keys(lock?.copies ?? {})) {
+    if (!lockCopies[key]) {
+      act(`forget ${key}`, () => rmSync(originalsDir(root, key), { recursive: true, force: true }));
     }
   }
 
@@ -479,11 +598,13 @@ export function apply(root, opts = {}) {
     if (f.before !== f.after) act(`update ${rel(root, f.path)}`, () => writeFileSync(f.path, f.after));
   }
 
-  const nextLock = { generatedBy: `${SELF}/scripts/configure.mjs`, config, skills: lockSkills };
-  act(`write ${LOCK_FILE}`, () => {
-    mkdirSync(dirname(join(root, LOCK_FILE)), { recursive: true });
-    writeFileSync(join(root, LOCK_FILE), `${JSON.stringify(nextLock, null, 2)}\n`);
-  });
+  const nextLock = { version: 2, generatedBy: `${SELF}/scripts/configure.mjs`, config, copies: lockCopies };
+  if (!sameJson(nextLock, lock)) {
+    act(`write ${LOCK_FILE}`, () => {
+      mkdirSync(dirname(join(root, LOCK_FILE)), { recursive: true });
+      writeFileSync(join(root, LOCK_FILE), `${JSON.stringify(nextLock, null, 2)}\n`);
+    });
+  }
   return nextLock;
 }
 
@@ -504,17 +625,15 @@ export function check(root) {
   if (!sameJson(config, lock.config)) {
     problems.push(`${CONFIG_FILE} changed since the paths were applied: run /configure-artifact-paths`);
   }
-  for (const skill of managedSkills(root)) {
-    for (const dir of skillCopies(root, skill.name)) {
-      const { state } = inspectCopy(root, skill, dir, lock);
-      if (state === "configured") continue;
-      if (state === "original") {
-        problems.push(`${rel(root, dir)} has the upstream paths (installed or updated by \`npx skills\`): run /configure-artifact-paths`);
-      } else if (state === "broken") {
-        problems.push(`${rel(root, dir)}: its originals under ${ORIGINALS_DIR} are missing or edited`);
-      } else {
-        problems.push(`${rel(root, dir)} was edited by hand`);
-      }
+  const { copies } = inspectAll(root, managedSkills(root), lock);
+  for (const c of copies) {
+    if (c.state === "configured") continue;
+    if (c.state === "original") {
+      problems.push(`${c.key} has the upstream paths (installed or updated by \`npx skills\`): run /configure-artifact-paths`);
+    } else if (c.state === "broken") {
+      problems.push(`${c.key}: its saved originals under ${ORIGINALS_DIR} are missing or edited`);
+    } else {
+      problems.push(`${c.key} was edited by hand`);
     }
   }
   for (const f of instructionFiles(root, lock.config.paths)) {

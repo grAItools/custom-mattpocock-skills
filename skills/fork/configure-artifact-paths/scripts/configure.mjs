@@ -70,8 +70,8 @@ try {
         force: args.force,
         dryRun: args["dry-run"],
       });
-      const n = Object.keys(lock.skills).length;
-      console.log(`${args["dry-run"] ? "would apply" : "applied"} the paths to ${n} skills`);
+      const n = Object.keys(lock.copies).length;
+      console.log(`${args["dry-run"] ? "would apply" : "applied"} the paths to ${n} installed skill cop${n === 1 ? "y" : "ies"}`);
       break;
     }
     case "check": {

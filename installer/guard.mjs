@@ -62,12 +62,42 @@ export const SENTINEL_PATHS = validateConfig({
   },
 }).paths;
 
-export function runGuard() {
-  const totals = Object.fromEntries(RULES.map((r) => [r.id, 0]));
+// Every rule must match at least once in each place it targets:
+//   - rules naming files: in each of those files of each named skill;
+//   - rules naming only skills: somewhere in each named skill;
+//   - rules naming neither: somewhere in the whole repo.
+// Summing across targets would hide a rule that broke in one file only.
+function unmatchedRules(countsBySkill) {
+  const unmatched = [];
+  const matches = (skill, file, id) => countsBySkill.get(skill)?.[file]?.[id] ?? 0;
+  const inSkill = (skill, id) =>
+    Object.values(countsBySkill.get(skill) ?? {}).reduce((n, byRule) => n + (byRule[id] ?? 0), 0);
+  for (const rule of RULES) {
+    if (rule.skills) {
+      for (const skill of rule.skills) {
+        if (!countsBySkill.has(skill)) {
+          unmatched.push(`${rule.id} (skill ${skill} not found)`);
+        } else if (rule.files) {
+          for (const file of rule.files) {
+            if (!matches(skill, file, rule.id)) unmatched.push(`${rule.id} in ${skill}/${file}`);
+          }
+        } else if (!inSkill(skill, rule.id)) {
+          unmatched.push(`${rule.id} in ${skill}`);
+        }
+      }
+    } else if (![...countsBySkill.keys()].some((skill) => inSkill(skill, rule.id))) {
+      unmatched.push(rule.id);
+    }
+  }
+  return unmatched;
+}
+
+export function runGuard(skills = listSkills()) {
+  const countsBySkill = new Map();
   const leftovers = [];
-  for (const [name, dir] of listSkills()) {
+  for (const [name, dir] of skills) {
     const { files, counts } = renderFiles(name, readSkill(dir), SENTINEL_PATHS);
-    for (const [id, n] of Object.entries(counts)) totals[id] += n;
+    countsBySkill.set(name, counts);
     for (const { rel, content } of files) {
       if (!isText(rel)) continue;
       content
@@ -81,16 +111,13 @@ export function runGuard() {
         });
     }
   }
-  const unmatched = Object.entries(totals)
-    .filter(([, n]) => n === 0)
-    .map(([id]) => id);
-  return { unmatched, leftovers };
+  return { unmatched: unmatchedRules(countsBySkill), leftovers };
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const { unmatched, leftovers } = runGuard();
   for (const id of unmatched) {
-    console.error(`rule "${id}" matched nothing: upstream changed its target text; update rules.mjs`);
+    console.error(`rule ${id} matched nothing: upstream changed its target text; update rules.mjs`);
   }
   for (const l of leftovers) {
     console.error(`default path survived rendering: ${l}; add a rule in rules.mjs`);

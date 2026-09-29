@@ -108,8 +108,10 @@ export const RULES = [
       "RESOURCES-FORMAT.md",
     ],
     when: isChanged("teachDir"),
+    // The file's own title: the first line, after any blank lines or HTML
+    // comments. Never a later `# ` line, which may sit inside a template.
     apply: regex(
-      /^(# .*\n)/,
+      /^((?:\s*\n|<!--[\s\S]*?-->\s*\n)*# .*\n)/,
       (_m, heading) =>
         `${heading}\nAll workspace paths in this file are relative to the teaching workspace, \`${ph("teachDir")}/\`.\n`,
     ),

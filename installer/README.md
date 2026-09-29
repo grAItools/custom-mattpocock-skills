@@ -22,20 +22,20 @@ Run `/configure-artifact-paths` again after every `npx skills add` or `npx skill
 node .agents/skills/configure-artifact-paths/scripts/configure.mjs check
 ```
 
-It fails when a skill still has the upstream paths, was edited by hand, or when the config changed without being applied.
+(Use the folder the skill is installed in: `.agents/skills/` for the universal install, or an agent folder such as `.claude/skills/` for a copy-mode install that only targets that agent.) It fails when a skill still has the upstream paths, was edited by hand, or when the config changed without being applied.
 
 ### What it writes (commit all of it)
 
 | Path | What |
 |---|---|
 | `.agents/skill-paths.json` | The chosen paths. |
-| `.agents/skills/<name>/` | The skills `npx skills` installed, rewritten in place. `.claude/skills/` links to them in symlink mode; in copy mode each copy is rewritten. |
-| `.agents/skill-paths/originals/<name>/*.orig` | The upstream text of each file it changed, so a later run can start from it. |
-| `.agents/skill-paths.lock.json` | The applied config and a hash of each skill before and after. |
+| `.agents/skills/<name>/` | The skills `npx skills` installed, rewritten in place. `.claude/skills/` links to them in symlink mode; in copy mode each copy (in any agent folder `npx skills` uses) is rewritten and tracked separately. |
+| `.agents/skill-paths/originals/<copy>/*.orig` | The upstream text of each file it changed, per installed copy (e.g. `originals/.agents/skills/tdd/`), so a later run can start from it. |
+| `.agents/skill-paths.lock.json` | The applied config and, per copy, a hash before and after. |
 | `AGENTS.md` | A generated `Artifact locations` block between `mattpocock-skills:paths` markers. The rest of the file is yours. |
-| `CLAUDE.md` | An `@AGENTS.md` line, so Claude Code reads `AGENTS.md` too. |
+| `CLAUDE.md` | An `@AGENTS.md` line, so Claude Code reads `AGENTS.md` too. Skipped when `CLAUDE.md` is a symlink to `AGENTS.md`. |
 
-Only skills that `skills-lock.json` lists with the same source as `configure-artifact-paths` are touched. A skill that was edited by hand is left alone (the script stops and names it) unless you pass `--force`.
+Only skills that `skills-lock.json` lists with the same source as `configure-artifact-paths` are touched. A copy in a non-hidden folder (`skills/`, `agent/skills/`, `data/skills/`) is only touched when its hash is recognised, so a project's own `skills/` folder is never mistaken for an install. A skill that was edited by hand is left alone (the script stops and names it) unless you pass `--force`: files the script had rewritten then come back from their saved originals (their hand edits are dropped, with a warning naming them) and hand edits elsewhere are kept.
 
 ### How it tells what it is looking at
 
@@ -44,6 +44,7 @@ Only skills that `skills-lock.json` lists with the same source as `configure-art
 - **original**: matches `skills-lock.json` (fresh install or update). Rendered directly.
 - **configured**: matches its own lock. The original is rebuilt from the `.orig` files and rendered again.
 - **modified**: matches neither. Left alone unless forced.
+- **broken**: rendered by the script, but its saved originals are missing or edited. Reinstall it.
 
 ### The paths
 
@@ -61,9 +62,9 @@ Only skills that `skills-lock.json` lists with the same source as `configure-art
 | `prototypeDir` | `null` | repo root | prototype (standalone prototypes only; UI routes still follow the app's routing) |
 | `wizardDir` | `null` | repo root | wizard |
 
-"Each context root" is the repo root in a single-context project, and each context folder (e.g. `src/ordering/`) in a multi-context one. `null` keeps the skill's own convention (for `handoffDir`, the OS temp directory).
+"Each context root" is the repo root in a single-context project, and each context folder (e.g. `src/ordering/`) in a multi-context one. `null` keeps the skill's own convention (for `handoffDir`, the OS temp directory). Two keys cannot share a path, and `.git/`, `node_modules/`, agent skill folders, the script's own files, `AGENTS.md`, `CLAUDE.md` and `skills-lock.json` are refused.
 
-When paths change and artifacts already exist at the old ones, `apply` stops and lists them: `--migrate` moves them (with `git mv` when tracked, including per-context copies) and rewrites references in `AGENTS.md`, `CLAUDE.md`, the context map and the files in `skillsConfigDir`; `--skip-migration` leaves them. A changed `teachDir` is reported, not moved.
+When paths change and artifacts already exist at the previous ones, `apply` stops and lists them. On the first apply the previous paths are the upstream defaults, so a project already using the skills gets the same prompt. `--migrate` moves them (with `git mv` when tracked, including per-context copies) and rewrites references in `AGENTS.md`, `CLAUDE.md`, the context map and the files in `skillsConfigDir`, in one pass so a new path is never rewritten again; `--skip-migration` leaves them. Every move is checked before any runs: a destination that already exists, a folder moved into itself, or two overlapping moves blocks `--migrate`. A changed `teachDir` is listed but always moved by hand.
 
 ## Keeping the fork in sync with upstream
 
@@ -78,8 +79,10 @@ Merge rather than rebase: `main` is published.
 
 The guard renders every skill (except `deprecated/`) with every path set to a sentinel value and fails when:
 
-- **a rule matched nothing**: upstream reworded the sentence that rule targets. Update its text in [rules.mjs](../skills/fork/configure-artifact-paths/scripts/lib/rules.mjs).
+- **a rule matched nothing in one of its targets** (each file it names, each skill it names, or the whole repo): upstream reworded the sentence that rule targets. Update its text in [rules.mjs](../skills/fork/configure-artifact-paths/scripts/lib/rules.mjs).
 - **a default path survived**: upstream added a reference in a form the rules do not cover (a new tree layout, a new folder). Add or extend a rule.
+
+The test suite also pins the folder hash `npx skills` 1.7.0 recorded for `installer/test/fixtures/hash-skill` (an `internal` skill, hidden from installs). If a newer `skills` release changes its hash algorithm, that test fails: fresh installs would then show as `modified`, so update `folderHash` in `project.mjs` and re-pin the value with `INSTALL_INTERNAL_SKILLS=1 npx skills@latest add installer/test/fixtures/hash-skill` in a scratch repo.
 
 ## How rendering works
 

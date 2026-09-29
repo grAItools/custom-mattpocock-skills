@@ -10,7 +10,8 @@ export function isText(rel) {
 }
 
 // files: [{ rel, content: Buffer }]. Returns { files, counts } where files
-// has the same shape and counts maps rule ids to their number of matches.
+// has the same shape and counts maps each file to { ruleId: matches } for
+// every rule that ran on it.
 export function renderFiles(name, files, paths) {
   const counts = {};
   const out = files.map((file) => {
@@ -22,7 +23,8 @@ export function renderFiles(name, files, paths) {
       if (rule.when && !rule.when(paths)) continue;
       const result = rule.apply(text);
       text = result.text;
-      counts[rule.id] = (counts[rule.id] ?? 0) + result.count;
+      counts[file.rel] ??= {};
+      counts[file.rel][rule.id] = (counts[file.rel][rule.id] ?? 0) + result.count;
     }
     return { ...file, content: Buffer.from(substitutePlaceholders(text, paths), "utf8") };
   });
