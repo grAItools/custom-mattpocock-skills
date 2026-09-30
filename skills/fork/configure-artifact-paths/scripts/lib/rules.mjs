@@ -9,6 +9,7 @@
 //   id:     stable name, reported by the guard when it stops matching.
 //   skills: skill names it applies to (omit for every skill).
 //   files:  skill-relative file paths it applies to (omit for every file).
+//   exceptSkills: skill names it never applies to.
 //   when:   predicate on the configured paths (omit to always run). Rules
 //           that would be a no-op on upstream defaults skip themselves, so
 //           a default config renders byte-identical skills.
@@ -44,31 +45,33 @@ const isSet = (key) => (paths) => paths[key] !== null;
 const isChanged = (key) => (paths) => paths[key] !== PATH_KEYS[key].default;
 
 // Longest tokens first. The look-behind stops matches inside longer names
-// (`MY-CONTEXT.md`), but a leading `/` is allowed so per-context paths such
+// (`MY-GLOSSARY.md`), but a leading `/` is allowed so per-context paths such
 // as `src/<context>/docs/adr/` are rewritten too.
-const TOKENS = [
-  ["CONTEXT-MAP.md", "contextMap"],
-  ["CONTEXT.md", "glossary"],
+export const TOKENS = [
+  ["GLOSSARY-MAP.md", "contextMap"],
+  ["GLOSSARY.md", "glossary"],
   ["docs/adr", "adrDir"],
   ["docs/agents", "skillsConfigDir"],
   [".scratch", "localTrackerDir"],
   [".out-of-scope", "outOfScopeDir"],
 ];
 const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-const TOKEN_RE = new RegExp(
+export const TOKEN_RE = new RegExp(
   `(?<![\\w.-])(${TOKENS.map(([t]) => escape(t)).join("|")})(?![\\w-])`,
   "g",
 );
 const TOKEN_KEY = Object.fromEntries(TOKENS);
 
+// /teach keeps its own `GLOSSARY.md` in its workspace (moved by teachDir,
+// not by glossary), so the path tokens never apply to it.
+export const TEACH = ["teach"];
+
 // Default tokens that must not survive a render with every path changed.
 export const LEFTOVER_PATTERNS = [
-  TOKEN_RE,
-  /^\W*── adr\//m,
-  /(?<![\w/@-])\.\/(learning-records|lessons|reference|assets)\//,
+  { pattern: TOKEN_RE, exceptSkills: TEACH },
+  { pattern: /^\W*── adr\//m },
+  { pattern: /(?<![\w/@-])\.\/(learning-records|lessons|reference|assets)\// },
 ];
-
-const TEACH = ["teach"];
 
 export const RULES = [
   // Directory trees draw `docs/` and `adr/` on separate lines. Collapse them
@@ -107,6 +110,7 @@ export const RULES = [
   },
   {
     id: "tokens",
+    exceptSkills: TEACH,
     apply: regex(TOKEN_RE, (_m, token) => ph(TOKEN_KEY[token])),
   },
   {

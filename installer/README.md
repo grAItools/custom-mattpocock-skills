@@ -56,8 +56,8 @@ Only skills that `skills-lock.json` lists with the same source as `configure-art
 
 | Key | Default | Relative to | Used by |
 |---|---|---|---|
-| `glossary` | `CONTEXT.md` | each context root | domain-modeling, grill-with-docs, tdd, triage, and most engineering skills |
-| `contextMap` | `CONTEXT-MAP.md` | repo root | domain-modeling, setup, wait-what |
+| `glossary` | `GLOSSARY.md` | each context root | domain-modeling, grill-with-docs, tdd, triage, and most engineering skills |
+| `contextMap` | `GLOSSARY-MAP.md` | repo root | domain-modeling, setup, wait-what |
 | `adrDir` | `docs/adr` | each context root | domain-modeling, improve-codebase-architecture, setup |
 | `skillsConfigDir` | `docs/agents` | repo root | setup-matt-pocock-skills, code-review |
 | `localTrackerDir` | `.scratch` | repo root | the local issue tracker: to-spec, to-tickets, wayfinder, code-review |
@@ -123,13 +123,14 @@ The guard renders every skill (except `deprecated/`) with every path set to a se
 
 - **a rule matched nothing in one of its targets** (each file it names, each skill it names, or the whole repo): upstream reworded the sentence that rule targets. Update its text in [rules.mjs](../skills/fork/configure-artifact-paths/scripts/lib/rules.mjs).
 - **a default path survived**: upstream added a reference to one of the known default paths in a form the rules do not cover (a new tree layout, a new sentence shape). Add or extend a rule.
+- **a default path appears in no skill**: upstream renamed or dropped it (as when `CONTEXT.md` became `GLOSSARY.md`). Change its default in [paths.mjs](../skills/fork/configure-artifact-paths/scripts/lib/paths.mjs) and its token in `rules.mjs`. Projects configured before keep the old name, since their config pins it.
 
-When adding a key, give it the upstream default: projects whose lock predates the key are treated as having used that default. The guard only knows the default paths listed in the table above. If upstream introduces a new kind of artifact folder, or spells an existing one differently (say `docs/adrs`), the guard stays green: review upstream diffs for new paths when merging, and add a key and rules for them.
+When adding a key, give it the upstream default: projects whose lock predates the key are treated as having used that default. The guard only knows the default paths listed in the table above. If upstream introduces a new kind of artifact folder, the guard stays green: review upstream diffs for new paths when merging, and add a key and rules for them.
 
 `REAL_SKILLS_CLI=1 node --test installer/test/*.test.mjs` also runs a round trip through the real `npx skills@1.7.0` (install, configure, reinstall, re-apply); CI runs it as a separate step. The test suite also pins the folder hash `npx skills` 1.7.0 recorded for `installer/test/fixtures/hash-skill` (an `internal` skill, hidden from installs). If a newer `skills` release changes its hash algorithm, that test fails: fresh installs would then show as `modified`, so update `folderHash` in `project.mjs` and re-pin the value with `INSTALL_INTERNAL_SKILLS=1 npx skills@latest add installer/test/fixtures/hash-skill` in a scratch repo.
 
 ## How rendering works
 
-Every file of a skill that decodes as UTF-8 is rendered and guarded, whatever its extension; binary files are copied as they are. Most references are plain tokens (`CONTEXT.md`, `docs/adr`, `.scratch`, ...) replaced wherever they appear, including inside per-context paths like `src/<context>/docs/adr/`. Skills with no fixed path (research, handoff, prototype, wizard, teach) get a targeted sentence rewrite, applied only when the key is set. One rule is not about paths: it makes `/setup-matt-pocock-skills` write its `## Agent skills` block to `AGENTS.md` (moving one it finds in `CLAUDE.md`), since Codex does not read `CLAUDE.md`. Another runs after the values are in and realigns the `←` comments in directory trees.
+Every file of a skill that decodes as UTF-8 is rendered and guarded, whatever its extension; binary files are copied as they are. Most references are plain tokens (`GLOSSARY.md`, `docs/adr`, `.scratch`, ...) replaced wherever they appear, including inside per-context paths like `src/<context>/docs/adr/`, except in `/teach`, whose own `GLOSSARY.md` belongs to its workspace and moves with `teachDir`. Skills with no fixed path (research, handoff, prototype, wizard, teach) get a targeted sentence rewrite, applied only when the key is set. One rule is not about paths: it makes `/setup-matt-pocock-skills` write its `## Agent skills` block to `AGENTS.md` (moving one it finds in `CLAUDE.md`), since Codex does not read `CLAUDE.md`. Another runs after the values are in and realigns the `←` comments in directory trees.
 
 Rules first replace matches with placeholders and only then substitute values, so a configured value is never rewritten by a later rule. With the default config, every skill renders byte-identical to upstream except `setup-matt-pocock-skills/SKILL.md`.

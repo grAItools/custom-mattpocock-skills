@@ -50,8 +50,8 @@ function project(opts) {
 }
 
 const CUSTOM = {
-  glossary: "docs/domain/GLOSSARY.md",
-  contextMap: "docs/domain/CONTEXT-MAP.md",
+  glossary: "docs/domain/DOMAIN.md",
+  contextMap: "docs/domain/GLOSSARY-MAP.md",
   adrDir: "docs/architecture/decisions",
   skillsConfigDir: ".agents/config",
   localTrackerDir: "work",
@@ -65,7 +65,7 @@ const asArgs = (paths) => Object.entries(paths).map(([k, v]) => `${k}=${v}`);
 test("config: fills defaults and normalizes", () => {
   const { paths } = validateConfig({ paths: { adrDir: "./docs/decisions/" } });
   assert.equal(paths.adrDir, "docs/decisions");
-  assert.equal(paths.glossary, "CONTEXT.md");
+  assert.equal(paths.glossary, "GLOSSARY.md");
   assert.equal(paths.researchDir, null);
 });
 
@@ -75,7 +75,7 @@ test("config: rejects unsafe or malformed values", () => {
     { adrDir: "/abs" },
     { adrDir: "a//b" },
     { adrDir: "." },
-    { glossary: "GLOSSARY.txt" },
+    { glossary: "DOMAIN.txt" },
     { glossary: null },
     { nope: "x" },
     { adrDir: "has space" },
@@ -127,7 +127,7 @@ test("render: custom paths reach every reference", () => {
   assert.match(renderOne("domain-modeling", "ADR-FORMAT.md", paths), /ADRs live in `docs\/architecture\/decisions\/`/);
   const domain = renderOne("setup-matt-pocock-skills", "domain.md", paths);
   assert.match(domain, /`src\/<context>\/docs\/architecture\/decisions\/`/);
-  assert.match(domain, /\*\*`docs\/domain\/GLOSSARY\.md`\*\* at the repo root/);
+  assert.match(domain, /\*\*`docs\/domain\/DOMAIN\.md`\*\* at the repo root/);
   assert.match(renderOne("to-tickets", "SKILL.md", paths), /`work\/<feature-slug>\/issues\/<NN>-<slug>\.md`/);
   assert.match(renderOne("code-review", "SKILL.md", paths), /`\.agents\/config\/issue-tracker\.md`/);
   assert.match(renderOne("research", "SKILL.md", paths), /Save it under `docs\/research\/`/);
@@ -135,17 +135,34 @@ test("render: custom paths reach every reference", () => {
 });
 
 test("render: a substituted value is never rewritten again", () => {
-  const paths = validateConfig({ paths: { glossary: "docs/adr/CONTEXT.md", adrDir: "docs/adr-log" } }).paths;
+  const paths = validateConfig({ paths: { glossary: "docs/adr/GLOSSARY.md", adrDir: "docs/adr-log" } }).paths;
   assert.match(renderOne("domain-modeling", "ADR-FORMAT.md", paths), /ADRs live in `docs\/adr-log\/`/);
   const skill = renderOne("domain-modeling", "SKILL.md", paths);
-  assert.match(skill, /`docs\/adr\/CONTEXT\.md`/);
-  assert.doesNotMatch(skill, /docs\/adr-log\/CONTEXT\.md|docs\/adr-log-log/);
+  assert.match(skill, /`docs\/adr\/GLOSSARY\.md`/);
+  assert.doesNotMatch(skill, /docs\/adr-log\/GLOSSARY\.md|docs\/adr-log-log/);
 });
 
 test("guard: passes on the current skills", () => {
-  const { unmatched, leftovers } = runGuard();
+  const { unmatched, leftovers, vanished } = runGuard();
   assert.deepEqual(unmatched, []);
   assert.deepEqual(leftovers, []);
+  assert.deepEqual(vanished, []);
+});
+
+test("guard: flags a default path upstream no longer uses", () => {
+  // As when upstream renamed CONTEXT.md to GLOSSARY.md: the old token then
+  // matched nothing, yet no rule failed and nothing survived rendering.
+  const renamed = new Map();
+  for (const [name, dir] of ALL) {
+    const copy = mkdtempSync(join(tmpdir(), "guard-"));
+    cpSync(dir, copy, { recursive: true });
+    for (const { rel } of readSkill(copy).filter((f) => f.rel.endsWith(".md"))) {
+      const file = join(copy, rel);
+      writeFileSync(file, readFileSync(file, "utf8").replaceAll("GLOSSARY-MAP.md", "DOMAIN-MAP.md"));
+    }
+    renamed.set(name, copy);
+  }
+  assert.deepEqual(runGuard(renamed).vanished, ["contextMap (GLOSSARY-MAP.md)"]);
 });
 
 // ---------------------------------------------------------------- apply
@@ -164,7 +181,7 @@ test("apply: rewrites installed skills in place and writes the project files", (
     read(root, ".agents/skill-paths/originals/.agents/skills/domain-modeling/ADR-FORMAT.md.orig"),
     readFileSync(join(ALL.get("domain-modeling"), "ADR-FORMAT.md"), "utf8"),
   );
-  assert.match(read(root, `.agents/skills/${SELF}/scripts/lib/paths.mjs`), /default: "CONTEXT\.md"/, "never rewrites itself");
+  assert.match(read(root, `.agents/skills/${SELF}/scripts/lib/paths.mjs`), /default: "GLOSSARY\.md"/, "never rewrites itself");
   assert.match(read(root, "CLAUDE.md"), /Existing notes\.\n\n@AGENTS\.md\n$/);
   assert.match(read(root, "AGENTS.md"), /\| `docs\/architecture\/decisions\/` \|/);
   assert.match(read(root, "AGENTS.md"), /\| `docs\/research\/` \|/);
@@ -264,42 +281,42 @@ test("apply --migrate: moves artifacts and rewrites references", () => {
   const root = project();
   execFileSync("git", ["init", "-q", root]);
   apply(root, { log: quiet });
-  writeFileSync(join(root, "CONTEXT.md"), "# Glossary\n");
+  writeFileSync(join(root, "GLOSSARY.md"), "# Glossary\n");
   mkdirSync(join(root, "src/ordering/docs/adr"), { recursive: true });
-  writeFileSync(join(root, "src/ordering/CONTEXT.md"), "# Ordering\n");
+  writeFileSync(join(root, "src/ordering/GLOSSARY.md"), "# Ordering\n");
   writeFileSync(join(root, "src/ordering/docs/adr/0001-x.md"), "# X\n");
-  writeFileSync(join(root, "CONTEXT-MAP.md"), "- [Ordering](./src/ordering/CONTEXT.md)\n");
+  writeFileSync(join(root, "GLOSSARY-MAP.md"), "- [Ordering](./src/ordering/GLOSSARY.md)\n");
   mkdirSync(join(root, "docs/agents"), { recursive: true });
-  writeFileSync(join(root, "docs/agents/domain.md"), "Read `CONTEXT.md` and `docs/adr/`.\n");
+  writeFileSync(join(root, "docs/agents/domain.md"), "Read `GLOSSARY.md` and `docs/adr/`.\n");
   writeFileSync(join(root, "AGENTS.md"), `${read(root, "AGENTS.md")}\nSee \`docs/agents/domain.md\`.\n`);
   execFileSync("git", ["-C", root, "add", "-A"]);
   execFileSync("git", ["-C", root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
 
-  setPaths(root, ["glossary=GLOSSARY.md", "adrDir=decisions", "skillsConfigDir=.agents/config"]);
+  setPaths(root, ["glossary=DOMAIN.md", "adrDir=decisions", "skillsConfigDir=.agents/config"]);
   assert.throws(() => apply(root, { log: quiet }), /--migrate/);
-  assert.ok(existsSync(join(root, "CONTEXT.md")), "does not move without --migrate");
-  assert.equal(JSON.parse(read(root, LOCK_FILE)).config.paths.glossary, "CONTEXT.md", "keeps the old lock");
+  assert.ok(existsSync(join(root, "GLOSSARY.md")), "does not move without --migrate");
+  assert.equal(JSON.parse(read(root, LOCK_FILE)).config.paths.glossary, "GLOSSARY.md", "keeps the old lock");
 
   apply(root, { log: quiet, migrate: true });
-  assert.ok(existsSync(join(root, "GLOSSARY.md")));
-  assert.ok(existsSync(join(root, "src/ordering/GLOSSARY.md")));
+  assert.ok(existsSync(join(root, "DOMAIN.md")));
+  assert.ok(existsSync(join(root, "src/ordering/DOMAIN.md")));
   assert.ok(existsSync(join(root, "src/ordering/decisions/0001-x.md")));
   assert.ok(!existsSync(join(root, "src/ordering/docs/adr")));
-  assert.equal(read(root, "CONTEXT-MAP.md"), "- [Ordering](./src/ordering/GLOSSARY.md)\n");
-  assert.equal(read(root, ".agents/config/domain.md"), "Read `GLOSSARY.md` and `decisions/`.\n");
+  assert.equal(read(root, "GLOSSARY-MAP.md"), "- [Ordering](./src/ordering/DOMAIN.md)\n");
+  assert.equal(read(root, ".agents/config/domain.md"), "Read `DOMAIN.md` and `decisions/`.\n");
   assert.match(read(root, "AGENTS.md"), /See `\.agents\/config\/domain\.md`/);
   const staged = execFileSync("git", ["-C", root, "status", "--porcelain"], { encoding: "utf8" });
-  assert.match(staged, /^R {2}CONTEXT\.md -> GLOSSARY\.md$/m, "tracked files move with git mv");
+  assert.match(staged, /^R {2}GLOSSARY\.md -> DOMAIN\.md$/m, "tracked files move with git mv");
   assert.deepEqual(check(root), []);
 });
 
 test("apply --skip-migration: leaves artifacts in place", () => {
   const root = project();
   apply(root, { log: quiet });
-  writeFileSync(join(root, "CONTEXT.md"), "# Glossary\n");
-  setPaths(root, ["glossary=GLOSSARY.md"]);
+  writeFileSync(join(root, "GLOSSARY.md"), "# Glossary\n");
+  setPaths(root, ["glossary=DOMAIN.md"]);
   apply(root, { log: quiet, skipMigration: true });
-  assert.ok(existsSync(join(root, "CONTEXT.md")));
+  assert.ok(existsSync(join(root, "GLOSSARY.md")));
   assert.deepEqual(check(root), []);
 });
 
@@ -313,18 +330,18 @@ test("hash: matches the computedHash npx skills 1.7.0 recorded for a fixture", (
 
 test("first apply: artifacts at the upstream defaults count as the previous locations", () => {
   const root = project();
-  writeFileSync(join(root, "CONTEXT.md"), "# Glossary\n");
+  writeFileSync(join(root, "GLOSSARY.md"), "# Glossary\n");
   mkdirSync(join(root, "docs/adr"), { recursive: true });
   writeFileSync(join(root, "docs/adr/0001-x.md"), "# X\n");
   mkdirSync(join(root, "docs/agents"), { recursive: true });
   writeFileSync(join(root, "docs/agents/issue-tracker.md"), "# Tracker\n");
   writeFileSync(join(root, "CLAUDE.md"), "## Agent skills\n\nSee `docs/agents/issue-tracker.md`.\n");
-  setPaths(root, ["glossary=GLOSSARY.md", "adrDir=decisions", "skillsConfigDir=agent-config"]);
+  setPaths(root, ["glossary=DOMAIN.md", "adrDir=decisions", "skillsConfigDir=agent-config"]);
 
   assert.throws(() => apply(root, { log: quiet }), /--migrate/);
   assert.ok(!existsSync(join(root, LOCK_FILE)), "nothing applied");
   apply(root, { log: quiet, migrate: true });
-  assert.ok(existsSync(join(root, "GLOSSARY.md")));
+  assert.ok(existsSync(join(root, "DOMAIN.md")));
   assert.ok(existsSync(join(root, "decisions/0001-x.md")));
   assert.ok(existsSync(join(root, "agent-config/issue-tracker.md")));
   assert.match(read(root, "CLAUDE.md"), /See `agent-config\/issue-tracker\.md`/);
@@ -415,22 +432,22 @@ test("migration refuses nested or overlapping moves before moving anything", () 
 test("migration rewrites references in one pass", () => {
   const root = project();
   apply(root, { log: quiet });
-  writeFileSync(join(root, "CLAUDE.md"), `${read(root, "CLAUDE.md")}\nGlossary: \`CONTEXT.md\`.\n`);
-  setPaths(root, ["glossary=docs/agents/GLOSSARY.md", "skillsConfigDir=config/agents"]);
+  writeFileSync(join(root, "CLAUDE.md"), `${read(root, "CLAUDE.md")}\nGlossary: \`GLOSSARY.md\`.\n`);
+  setPaths(root, ["glossary=docs/agents/DOMAIN.md", "skillsConfigDir=config/agents"]);
   apply(root, { log: quiet, migrate: true });
-  assert.match(read(root, "CLAUDE.md"), /Glossary: `docs\/agents\/GLOSSARY\.md`/);
+  assert.match(read(root, "CLAUDE.md"), /Glossary: `docs\/agents\/DOMAIN\.md`/);
 });
 
 test("dry-run migration lists a context map that moves", () => {
   const root = project();
   apply(root, { log: quiet });
-  writeFileSync(join(root, "CONTEXT-MAP.md"), "- [Ordering](./src/ordering/CONTEXT.md)\n");
-  setPaths(root, ["contextMap=domain/MAP.md", "glossary=GLOSSARY.md"]);
+  writeFileSync(join(root, "GLOSSARY-MAP.md"), "- [Ordering](./src/ordering/GLOSSARY.md)\n");
+  setPaths(root, ["contextMap=domain/MAP.md", "glossary=DOMAIN.md"]);
   const logs = [];
   apply(root, { log: (m) => logs.push(m), migrate: true, dryRun: true });
-  assert.ok(logs.some((l) => l.includes("update path references in CONTEXT-MAP.md")), logs.join("\n"));
+  assert.ok(logs.some((l) => l.includes("update path references in GLOSSARY-MAP.md")), logs.join("\n"));
   apply(root, { log: quiet, migrate: true });
-  assert.equal(read(root, "domain/MAP.md"), "- [Ordering](../src/ordering/GLOSSARY.md)\n", "re-based for its new folder");
+  assert.equal(read(root, "domain/MAP.md"), "- [Ordering](../src/ordering/DOMAIN.md)\n", "re-based for its new folder");
 });
 
 test("copies in nested agent folders are rendered; a project's own skills/ folder is not", () => {
@@ -522,23 +539,23 @@ test("migration looks for per-context artifacts only where the context map point
   const root = project();
   apply(root, { log: quiet });
   for (const dir of ["src/ordering", "third_party/lib", "build/docs/adr"]) mkdirSync(join(root, dir), { recursive: true });
-  writeFileSync(join(root, "src/ordering/CONTEXT.md"), "# Ordering\n");
-  writeFileSync(join(root, "third_party/lib/CONTEXT.md"), "# Vendored\n");
-  setPaths(root, ["glossary=GLOSSARY.md", "adrDir=decisions"]);
+  writeFileSync(join(root, "src/ordering/GLOSSARY.md"), "# Ordering\n");
+  writeFileSync(join(root, "third_party/lib/GLOSSARY.md"), "# Vendored\n");
+  setPaths(root, ["glossary=DOMAIN.md", "adrDir=decisions"]);
   apply(root, { log: quiet, skipMigration: true });
-  assert.ok(existsSync(join(root, "third_party/lib/CONTEXT.md")), "no map: single context, nothing below the root");
+  assert.ok(existsSync(join(root, "third_party/lib/GLOSSARY.md")), "no map: single context, nothing below the root");
 
   const root2 = project();
   apply(root2, { log: quiet });
   for (const dir of ["src/ordering/docs/adr", "third_party/lib"]) mkdirSync(join(root2, dir), { recursive: true });
-  writeFileSync(join(root2, "src/ordering/CONTEXT.md"), "# Ordering\n");
-  writeFileSync(join(root2, "third_party/lib/CONTEXT.md"), "# Vendored\n");
-  writeFileSync(join(root2, "CONTEXT-MAP.md"), "- [Ordering](./src/ordering/CONTEXT.md)\n");
-  setPaths(root2, ["glossary=GLOSSARY.md", "adrDir=decisions"]);
+  writeFileSync(join(root2, "src/ordering/GLOSSARY.md"), "# Ordering\n");
+  writeFileSync(join(root2, "third_party/lib/GLOSSARY.md"), "# Vendored\n");
+  writeFileSync(join(root2, "GLOSSARY-MAP.md"), "- [Ordering](./src/ordering/GLOSSARY.md)\n");
+  setPaths(root2, ["glossary=DOMAIN.md", "adrDir=decisions"]);
   apply(root2, { log: quiet, migrate: true });
-  assert.ok(existsSync(join(root2, "src/ordering/GLOSSARY.md")));
+  assert.ok(existsSync(join(root2, "src/ordering/DOMAIN.md")));
   assert.ok(existsSync(join(root2, "src/ordering/decisions")));
-  assert.ok(existsSync(join(root2, "third_party/lib/CONTEXT.md")), "vendored copy untouched");
+  assert.ok(existsSync(join(root2, "third_party/lib/GLOSSARY.md")), "vendored copy untouched");
 });
 
 test("a dangling CLAUDE.md -> AGENTS.md symlink still means one file", () => {
@@ -613,29 +630,29 @@ test("links to root artifacts stay correct when the context map moves or sits in
   mkdirSync(join(root, "docs/adr"), { recursive: true });
   mkdirSync(join(root, ".scratch/feat"), { recursive: true });
   mkdirSync(join(root, "src/ordering"), { recursive: true });
-  writeFileSync(join(root, "CONTEXT.md"), "# G\n");
-  writeFileSync(join(root, "src/ordering/CONTEXT.md"), "# O\n");
+  writeFileSync(join(root, "GLOSSARY.md"), "# G\n");
+  writeFileSync(join(root, "src/ordering/GLOSSARY.md"), "# O\n");
   writeFileSync(join(root, ".scratch/feat/spec.md"), "# S\n");
   writeFileSync(
-    join(root, "CONTEXT-MAP.md"),
-    "- [root](./CONTEXT.md) [adr](./docs/adr/) [work](.scratch/feat/spec.md) [ordering](./src/ordering/CONTEXT.md) [site](https://x.y/docs/adr/)\n",
+    join(root, "GLOSSARY-MAP.md"),
+    "- [root](./GLOSSARY.md) [adr](./docs/adr/) [work](.scratch/feat/spec.md) [ordering](./src/ordering/GLOSSARY.md) [site](https://x.y/docs/adr/)\n",
   );
-  setPaths(root, ["glossary=docs/GLOSSARY.md", "contextMap=docs/MAP.md", "adrDir=docs/decisions", "localTrackerDir=work"]);
+  setPaths(root, ["glossary=docs/DOMAIN.md", "contextMap=docs/MAP.md", "adrDir=docs/decisions", "localTrackerDir=work"]);
   apply(root, { log: quiet, migrate: true });
   assert.equal(
     read(root, "docs/MAP.md"),
-    "- [root](./GLOSSARY.md) [adr](./decisions/) [work](../work/feat/spec.md) [ordering](../src/ordering/docs/GLOSSARY.md) [site](https://x.y/docs/adr/)\n",
+    "- [root](./DOMAIN.md) [adr](./decisions/) [work](../work/feat/spec.md) [ordering](../src/ordering/docs/DOMAIN.md) [site](https://x.y/docs/adr/)\n",
   );
-  for (const target of ["docs/GLOSSARY.md", "docs/decisions", "work/feat/spec.md", "src/ordering/docs/GLOSSARY.md"]) {
+  for (const target of ["docs/DOMAIN.md", "docs/decisions", "work/feat/spec.md", "src/ordering/docs/DOMAIN.md"]) {
     assert.ok(existsSync(join(root, target)), target);
   }
 
   // The map stays in docs/; the glossary moves again.
-  setPaths(root, ["glossary=domain/GLOSSARY.md"]);
+  setPaths(root, ["glossary=domain/DOMAIN.md"]);
   apply(root, { log: quiet, migrate: true });
-  assert.match(read(root, "docs/MAP.md"), /\[root\]\(\.\.\/domain\/GLOSSARY\.md\)/);
-  assert.match(read(root, "docs/MAP.md"), /\[ordering\]\(\.\.\/src\/ordering\/domain\/GLOSSARY\.md\)/);
-  assert.ok(existsSync(join(root, "src/ordering/domain/GLOSSARY.md")));
+  assert.match(read(root, "docs/MAP.md"), /\[root\]\(\.\.\/domain\/DOMAIN\.md\)/);
+  assert.match(read(root, "docs/MAP.md"), /\[ordering\]\(\.\.\/src\/ordering\/domain\/DOMAIN\.md\)/);
+  assert.ok(existsSync(join(root, "src/ordering/domain/DOMAIN.md")));
 });
 
 // ---------------------------------------------------------------- third review
@@ -668,7 +685,7 @@ test("render: setup moves an existing Agent skills block out of CLAUDE.md", () =
 });
 
 test("render: tree comments stay aligned", () => {
-  const paths = validateConfig({ paths: { adrDir: "docs/architecture/decisions", glossary: "docs/domain/GLOSSARY.md" } }).paths;
+  const paths = validateConfig({ paths: { adrDir: "docs/architecture/decisions", glossary: "docs/domain/DOMAIN.md" } }).paths;
   const arrows = renderOne("domain-modeling", "SKILL.md", paths)
     .split("\n")
     .filter((l) => l.includes(" ← "))
@@ -679,37 +696,49 @@ test("render: tree comments stay aligned", () => {
 test("config: nested paths and agent home folders are refused", () => {
   for (const paths of [
     { adrDir: "docs" },
-    { glossary: "docs/adr/GLOSSARY.md" },
+    { glossary: "docs/adr/DOMAIN.md" },
     { localTrackerDir: ".agents" },
     { localTrackerDir: ".Claude" },
     { researchDir: "learning/research", teachDir: "learning" },
   ]) {
     assert.throws(() => validateConfig({ paths }), /inside|agent's own folder/, JSON.stringify(paths));
   }
-  assert.doesNotThrow(() => validateConfig({ paths: { skillsConfigDir: ".agents/config", glossary: "GLOSSARY.md" } }));
+  assert.doesNotThrow(() => validateConfig({ paths: { skillsConfigDir: ".agents/config", glossary: "DOMAIN.md" } }));
 });
 
 test("config: teach workspace collisions only matter when /teach is installed", () => {
   const root = project();
-  setPaths(root, ["glossary=GLOSSARY.md"]);
+  setPaths(root, ["glossary=MISSION.md"]);
   skillsAdd(root, ["teach"]);
-  assert.throws(() => apply(root, { log: quiet }), /collides with the \/teach workspace's GLOSSARY\.md/);
+  assert.throws(() => apply(root, { log: quiet }), /collides with the \/teach workspace's MISSION\.md/);
   setPaths(root, ["teachDir=learning"]);
   apply(root, { log: quiet });
+});
+
+test("upstream's shared GLOSSARY.md: allowed at the defaults, never migrated blindly", () => {
+  const root = project();
+  skillsAdd(root, ["teach"]);
+  apply(root, { log: quiet });
+  writeFileSync(join(root, "GLOSSARY.md"), "# G\n");
+  setPaths(root, ["glossary=DOMAIN.md"]);
+  assert.throws(() => apply(root, { log: quiet, migrate: true }), /may be \/teach's workspace glossary/);
+  assert.ok(existsSync(join(root, "GLOSSARY.md")));
+  apply(root, { log: quiet, skipMigration: true });
+  assert.ok(existsSync(join(root, "GLOSSARY.md")), "left for a human to split");
 });
 
 test("a migration stopped halfway finishes with --migrate", () => {
   const root = project();
   apply(root, { log: quiet });
-  writeFileSync(join(root, "CONTEXT.md"), "# G\n");
+  writeFileSync(join(root, "GLOSSARY.md"), "# G\n");
   mkdirSync(join(root, "docs/adr"), { recursive: true });
-  writeFileSync(join(root, "CLAUDE.md"), `${read(root, "CLAUDE.md")}\nSee \`CONTEXT.md\` and \`docs/adr/\`.\n`);
-  setPaths(root, ["glossary=GLOSSARY.md", "adrDir=decisions"]);
+  writeFileSync(join(root, "CLAUDE.md"), `${read(root, "CLAUDE.md")}\nSee \`GLOSSARY.md\` and \`docs/adr/\`.\n`);
+  setPaths(root, ["glossary=DOMAIN.md", "adrDir=decisions"]);
   // As if the run died after its first move.
-  execFileSync("mv", [join(root, "CONTEXT.md"), join(root, "GLOSSARY.md")]);
+  execFileSync("mv", [join(root, "GLOSSARY.md"), join(root, "DOMAIN.md")]);
   apply(root, { log: quiet, migrate: true });
   assert.ok(existsSync(join(root, "decisions")));
-  assert.match(read(root, "CLAUDE.md"), /See `GLOSSARY\.md` and `decisions\/`\./);
+  assert.match(read(root, "CLAUDE.md"), /See `DOMAIN\.md` and `decisions\/`\./);
   assert.deepEqual(check(root), []);
 });
 
@@ -815,14 +844,14 @@ test("Claude Code @imports follow moved artifacts", () => {
   const root = project();
   apply(root, { log: quiet });
   mkdirSync(join(root, "docs/agents"), { recursive: true });
-  writeFileSync(join(root, "CONTEXT.md"), "# G\n");
+  writeFileSync(join(root, "GLOSSARY.md"), "# G\n");
   writeFileSync(join(root, "docs/agents/domain.md"), "# D\n");
-  writeFileSync(join(root, "CLAUDE.md"), `${read(root, "CLAUDE.md")}@CONTEXT.md\nSee @docs/agents/domain.md, mail a@b.com, ask @alice.\n`);
-  setPaths(root, ["glossary=docs/GLOSSARY.md", "skillsConfigDir=agent-config"]);
-  assert.throws(() => apply(root, { log: quiet }), /\+ @docs\/GLOSSARY\.md/);
+  writeFileSync(join(root, "CLAUDE.md"), `${read(root, "CLAUDE.md")}@GLOSSARY.md\nSee @docs/agents/domain.md, mail a@b.com, ask @alice.\n`);
+  setPaths(root, ["glossary=docs/DOMAIN.md", "skillsConfigDir=agent-config"]);
+  assert.throws(() => apply(root, { log: quiet }), /\+ @docs\/DOMAIN\.md/);
   apply(root, { log: quiet, migrate: true });
   const text = read(root, "CLAUDE.md");
-  assert.match(text, /^@docs\/GLOSSARY\.md$/m);
+  assert.match(text, /^@docs\/DOMAIN\.md$/m);
   assert.match(text, /See @agent-config\/domain\.md, mail a@b\.com, ask @alice\./);
 });
 
