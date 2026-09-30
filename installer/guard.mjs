@@ -3,7 +3,9 @@
 // value and fails when:
 //   - a rule matched nothing (upstream reworded or removed its target), or
 //   - a default path survived rendering (upstream added a reference the
-//     rules do not cover).
+//     rules do not cover), or
+//   - a default path appears nowhere upstream any more (upstream renamed
+//     it, e.g. CONTEXT.md to GLOSSARY.md: update its default in paths.mjs).
 // Run it after every merge from upstream; CI runs it on every push.
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
@@ -11,7 +13,7 @@ import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateConfig } from "../skills/fork/configure-artifact-paths/scripts/lib/paths.mjs";
 import { isText, renderFiles } from "../skills/fork/configure-artifact-paths/scripts/lib/render.mjs";
-import { LEFTOVER_PATTERNS, RULES } from "../skills/fork/configure-artifact-paths/scripts/lib/rules.mjs";
+import { LEFTOVER_PATTERNS, RULES, TEACH, TOKENS, TOKEN_RE } from "../skills/fork/configure-artifact-paths/scripts/lib/rules.mjs";
 import { SELF } from "../skills/fork/configure-artifact-paths/scripts/lib/project.mjs";
 
 export const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -95,8 +97,15 @@ function unmatchedRules(countsBySkill) {
 export function runGuard(skills = listSkills()) {
   const countsBySkill = new Map();
   const leftovers = [];
+  const seen = new Set();
   for (const [name, dir] of skills) {
-    const { files, counts } = renderFiles(name, readSkill(dir), SENTINEL_PATHS);
+    const original = readSkill(dir);
+    if (!TEACH.includes(name)) {
+      for (const { content } of original) {
+        if (isText(content)) for (const m of content.toString("utf8").matchAll(TOKEN_RE)) seen.add(m[1]);
+      }
+    }
+    const { files, counts } = renderFiles(name, original, SENTINEL_PATHS);
     countsBySkill.set(name, counts);
     for (const { rel, content } of files) {
       if (!isText(content)) continue;
@@ -104,24 +113,29 @@ export function runGuard(skills = listSkills()) {
         .toString("utf8")
         .split("\n")
         .forEach((line, i) => {
-          for (const pattern of LEFTOVER_PATTERNS) {
+          for (const { pattern, exceptSkills } of LEFTOVER_PATTERNS) {
+            if (exceptSkills?.includes(name)) continue;
             const match = line.match(new RegExp(pattern.source, pattern.flags.replace("g", "")));
             if (match) leftovers.push(`${name}/${rel}:${i + 1}: ${match[0]}`);
           }
         });
     }
   }
-  return { unmatched: unmatchedRules(countsBySkill), leftovers };
+  const vanished = TOKENS.filter(([token]) => !seen.has(token)).map(([token, key]) => `${key} (${token})`);
+  return { unmatched: unmatchedRules(countsBySkill), leftovers, vanished };
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  const { unmatched, leftovers } = runGuard();
+  const { unmatched, leftovers, vanished } = runGuard();
   for (const id of unmatched) {
     console.error(`rule ${id} matched nothing: upstream changed its target text; update rules.mjs`);
   }
   for (const l of leftovers) {
     console.error(`default path survived rendering: ${l}; add a rule in rules.mjs`);
   }
-  if (unmatched.length || leftovers.length) process.exit(1);
-  console.log("guard: every rule matched and no default path survived rendering");
+  for (const v of vanished) {
+    console.error(`default path ${v} appears in no skill: upstream renamed or dropped it; update paths.mjs and rules.mjs`);
+  }
+  if (unmatched.length || leftovers.length || vanished.length) process.exit(1);
+  console.log("guard: every rule matched, every default path is still in use, and none survived rendering");
 }

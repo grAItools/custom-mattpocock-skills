@@ -30,6 +30,7 @@ export function renderFiles(name, files, paths) {
       for (const rule of RULES) {
         if (Boolean(rule.post) !== post) continue;
         if (rule.skills && !rule.skills.includes(name)) continue;
+        if (rule.exceptSkills?.includes(name)) continue;
         if (rule.files && !rule.files.includes(file.rel)) continue;
         if (rule.when && !rule.when(paths)) continue;
         const result = rule.apply(text);

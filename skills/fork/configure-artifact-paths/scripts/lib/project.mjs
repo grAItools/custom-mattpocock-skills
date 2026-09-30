@@ -508,7 +508,7 @@ export function planMigration(root, oldPaths, newPaths) {
 // pass so a new value is never rewritten again by a later key. A path must
 // start the span (optionally after `./`), or, for the per-context glossary
 // and ADR folder, follow one of the known context folders
-// (`src/ordering/CONTEXT.md`, also behind `../`). It must end the span or be
+// (`src/ordering/GLOSSARY.md`, also behind `../`). It must end the span or be
 // followed by `/` or `#`, so `issues` never matches inside `issues-log`.
 function referenceRewriter(oldPaths, newPaths, contextPrefixes) {
   const keys = Object.keys(PATH_KEYS)
@@ -712,6 +712,15 @@ export function apply(root, opts = {}) {
   const oldPaths = lock?.config?.paths ?? defaultPaths();
   if (!sameJson(oldPaths, config.paths)) {
     const { moves, problems, manual } = planMigration(root, oldPaths, config.paths);
+    // With /teach's workspace at the root, its glossary and the domain
+    // glossary are both `GLOSSARY.md`: moving that file could take /teach's.
+    if (
+      skills.some((s) => s.name === "teach") && oldPaths.teachDir === "." &&
+      oldPaths.glossary.toLowerCase() === "glossary.md" &&
+      moves.some((m) => rel(root, m.src) === oldPaths.glossary)
+    ) {
+      problems.push(`${oldPaths.glossary} may be /teach's workspace glossary as well as the domain glossary; move it by hand, or set teachDir first`);
+    }
     const rewrites = planReferenceRewrites(root, oldPaths, config.paths);
     if (migrate) {
       if (problems.length) throw new Error(`cannot migrate:\n  ${problems.join("\n  ")}`);

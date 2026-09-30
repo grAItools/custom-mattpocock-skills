@@ -12,13 +12,13 @@
 
 export const PATH_KEYS = {
   glossary: {
-    default: "CONTEXT.md",
+    default: "GLOSSARY.md",
     kind: "file",
     scope: "context",
     label: "Domain glossary",
   },
   contextMap: {
-    default: "CONTEXT-MAP.md",
+    default: "GLOSSARY-MAP.md",
     kind: "file",
     scope: "repo",
     label: "Context map (multi-context projects)",
@@ -204,6 +204,9 @@ export function validateConfig(raw) {
 export function checkTeachCollisions(paths) {
   for (const [key, value] of Object.entries(paths)) {
     if (key === "teachDir" || value === null) continue;
+    // Upstream's own layout: its domain glossary and /teach's glossary are
+    // both `GLOSSARY.md` in the current directory. Only flag what was chosen.
+    if (value === PATH_KEYS[key].default && paths.teachDir === PATH_KEYS.teachDir.default) continue;
     for (const entry of TEACH_ENTRIES) {
       const taken = paths.teachDir === "." ? entry : `${paths.teachDir}/${entry}`;
       if (within(value, taken)) {
